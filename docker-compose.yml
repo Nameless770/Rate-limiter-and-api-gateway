@@ -1,0 +1,57 @@
+# Two gateway instances behind different ports, sharing one Redis. Send requests with the same X-API-Key to
+# :8080 and :8081 and they draw from a single rate-limit budget: that is the distributed part.
+# Host ports can be moved if they're taken: GATEWAY_A_PORT=18080 GATEWAY_B_PORT=18081 docker compose up
+name: api-gateway
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Rate-limit state is disposable, so skip persistence entirely.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  upstream:
+    build: .
+    command: ["node", "demo/flaky-upstream.mjs"]
+    environment:
+      PORT: "9001"
+    ports:
+      - "${UPSTREAM_PORT:-9001}:9001" # exposed so you can flip /_demo/failure?rate=1 from the host
+    healthcheck: # the image's own healthcheck probes the gateway port, which this service doesn't use
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9001/health"]
+      interval: 10s
+      timeout: 3s
+
+  gateway-a: &gateway
+    build: .
+    ports:
+      - "${GATEWAY_A_PORT:-8080}:8080"
+    environment:
+      REDIS_URL: redis://redis:6379
+      UPSTREAM_URL: http://upstream:9001
+    depends_on:
+      redis:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+
+  gateway-b:
+    <<: *gateway
+    ports:
+      - "${GATEWAY_B_PORT:-8081}:8080"
+
+  # The whole test suite on Linux against the real Redis above (opt-in: `docker compose run --rm tests`).
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy

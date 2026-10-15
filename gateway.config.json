@@ -1,0 +1,47 @@
+{
+  "port": 8080,
+
+  "rateLimit": {
+    "identityHeader": "x-api-key",
+    "failureMode": "local",
+    "default": { "algorithm": "sliding-window", "limit": 60, "windowMs": 60000 }
+  },
+
+  "cache": { "maxEntries": 1000, "maxBytes": 52428800, "maxEntryBytes": 1048576 },
+
+  "upstreams": {
+    "demo": {
+      "url": "${UPSTREAM_URL:-http://localhost:9001}",
+      "timeoutMs": 1000,
+      "totalTimeoutMs": 2500,
+      "retry": { "maxAttempts": 3, "baseDelayMs": 50, "maxDelayMs": 500, "retryOnStatus": [502, 503, 504] },
+      "breaker": {
+        "failureRateThreshold": 0.5,
+        "minimumRequests": 6,
+        "windowMs": 10000,
+        "openDurationMs": 8000,
+        "halfOpenMaxCalls": 1,
+        "halfOpenSuccesses": 2
+      }
+    }
+  },
+
+  "routes": [
+    {
+      "id": "time",
+      "path": "/time",
+      "upstream": "demo",
+      "stripPrefix": false,
+      "cache": { "ttlMs": 5000 }
+    },
+    {
+      "id": "echo",
+      "path": "/echo",
+      "upstream": "demo",
+      "stripPrefix": false,
+      "rateLimit": { "algorithm": "token-bucket", "capacity": 10, "refillPerSecond": 2 }
+    },
+    { "id": "slow", "path": "/slow", "upstream": "demo", "stripPrefix": false },
+    { "id": "flaky", "path": "/flaky", "upstream": "demo", "stripPrefix": false }
+  ]
+}

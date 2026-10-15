@@ -1,0 +1,30 @@
+{
+  "name": "api-gateway",
+  "version": "0.1.0",
+  "description": "Rate limiter and API gateway: sliding-window / token-bucket limiting in Redis, routing, caching, retries, circuit breaking.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo:upstream": "node demo/flaky-upstream.mjs",
+    "demo:hammer": "node demo/hammer.mjs"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  }
+}

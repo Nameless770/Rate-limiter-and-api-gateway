@@ -1,0 +1,216 @@
+import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
+import https from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
+import { parseConfig } from '../src/config.js';
+import { Gateway, type GatewayDeps } from '../src/gateway.js';
+import { createLogger, silentLogger, type Logger } from '../src/observability/logger.js';
+
+/** Absolute path of a file under test/fixtures. */
+export const fixture = (relative: string): string => fileURLToPath(new URL(`./fixtures/${relative}`, import.meta.url));
+
+export interface Hit {
+  method: string;
+  url: string;
+  headers: IncomingHttpHeaders;
+  body: string;
+}
+
+export interface FakeUpstream {
+  url: string;
+  port: number;
+  hits: Hit[];
+  close(): Promise<void>;
+}
+
+export type UpstreamHandler = (req: IncomingMessage, res: ServerResponse, hit: Hit, hitNumber: number) => void | Promise<void>;
+
+export interface UpstreamOptions {
+  /** Serve HTTPS with this key and certificate instead of plain HTTP. */
+  tls?: { key: string | Buffer; cert: string | Buffer };
+}
+
+/** Start a real HTTP(S) server on an ephemeral port that records every request it receives. */
+export async function startUpstream(handler: UpstreamHandler, options: UpstreamOptions = {}): Promise<FakeUpstream> {
+  const hits: Hit[] = [];
+  const listener = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const hit: Hit = {
+      method: req.method ?? '',
+      url: req.url ?? '',
+      headers: req.headers,
+      body: Buffer.concat(chunks).toString(),
+    };
+    hits.push(hit);
+    try {
+      await handler(req, res, hit, hits.length);
+    } catch {
+      res.destroy();
+    }
+  };
+  const server = options.tls ? https.createServer(options.tls, listener) : http.createServer(listener);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `${options.tls ? 'https' : 'http'}://127.0.0.1:${port}`,
+    port,
+    hits,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+export function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), ...headers });
+  res.end(payload);
+}
+
+export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * GET with the request target sent exactly as given. `fetch` normalizes dot-segments before sending, so it
+ * can't exercise how the server treats a hostile path.
+ */
+export function rawGet(base: string, path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname, port, path, method: 'GET', headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+export interface RawResponse {
+  status: number;
+  headers: IncomingHttpHeaders;
+  body: string;
+  /** False when the connection died before the full body arrived. */
+  complete: boolean;
+}
+
+/**
+ * One request on its own connection, with full control over framing. Each entry in `chunks` is written
+ * separately, so without a Content-Length header the body goes out chunked. Writing stops as soon as a
+ * response arrives (a server may answer, say 413, before the upload is finished).
+ */
+export function rawRequest(
+  base: string,
+  opts: {
+    method?: string;
+    path: string;
+    headers?: Record<string, string>;
+    chunks?: string[];
+    chunkDelayMs?: number;
+    /** Defaults to a fresh connection that asks to be closed afterwards (Connection: close). */
+    agent?: http.Agent;
+  },
+): Promise<RawResponse> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    let responded = false;
+    const req = http.request(
+      { hostname, port, path: opts.path, method: opts.method ?? 'GET', headers: opts.headers, agent: opts.agent ?? false },
+      (res) => {
+        responded = true;
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('error', () => {}); // a body cut short surfaces below as complete === false
+        res.on('close', () =>
+          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks).toString(), complete: res.complete }),
+        );
+      },
+    );
+    req.on('error', (error) => {
+      if (!responded) reject(error);
+    });
+    void (async () => {
+      for (const chunk of opts.chunks ?? []) {
+        if (responded || req.destroyed) return;
+        req.write(chunk);
+        if (opts.chunkDelayMs) await sleep(opts.chunkDelayMs);
+      }
+      if (!responded && !req.destroyed) req.end();
+    })();
+  });
+}
+
+/** A logger that keeps every line, so tests can assert nothing was logged at error level. */
+export function capturingLogger(): { logger: Logger; lines: Array<Record<string, unknown>> } {
+  const lines: Array<Record<string, unknown>> = [];
+  return { logger: createLogger('debug', (line) => void lines.push(JSON.parse(line) as Record<string, unknown>)), lines };
+}
+
+/**
+ * A stand-in for an ioredis client that implements just enough for the Lua-backed limiters. Lets the tests
+ * drive the real gateway through Redis success and failure paths without a Redis server.
+ */
+export function fakeRedis() {
+  const state = { failing: false, calls: [] as string[] };
+  const commands: Record<string, (key: string, ...args: unknown[]) => Promise<number[]>> = {};
+  const client = {
+    status: 'ready',
+    defineCommand(name: string) {
+      commands[name] = async (key: string) => {
+        state.calls.push(key);
+        if (state.failing) throw new Error('ECONNREFUSED fake redis down');
+        return [1, 2, 0, 1000]; // allowed, 2 remaining
+      };
+      (client as Record<string, unknown>)[name] = commands[name];
+    },
+  };
+  return { client: client as never, state };
+}
+
+/** A port with nothing listening on it, for exercising connect failures. */
+export async function closedPort(): Promise<number> {
+  const server = http.createServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+export interface TestClock {
+  (): number;
+  advance(ms: number): void;
+}
+
+export function fakeClock(start = 1_700_000_000_000): TestClock {
+  let now = start;
+  const clock = (() => now) as TestClock;
+  clock.advance = (ms: number) => void (now += ms);
+  return clock;
+}
+
+export interface RunningGateway {
+  gateway: Gateway;
+  base: string;
+  clock: TestClock;
+  /** Backoff delays the retry loop asked for (sleeps are skipped, not performed). */
+  delays: number[];
+  close(): Promise<void>;
+}
+
+export async function startGateway(raw: Record<string, unknown>, deps: GatewayDeps = {}): Promise<RunningGateway> {
+  const config = parseConfig({ host: '127.0.0.1', port: 0, shutdownGraceMs: 500, ...raw });
+  const clock = fakeClock();
+  const delays: number[] = [];
+  const gateway = new Gateway(config, {
+    logger: silentLogger,
+    clock,
+    sleep: async (ms) => void delays.push(ms),
+    random: () => 0.999999,
+    ...deps,
+  });
+  const { port } = await gateway.listen(0, '127.0.0.1');
+  return { gateway, base: `http://127.0.0.1:${port}`, clock, delays, close: () => gateway.close(500) };
+}
