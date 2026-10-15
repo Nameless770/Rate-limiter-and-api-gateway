@@ -16,7 +16,7 @@ const duration = Number(args.duration ?? 8);
 const connections = Number(args.connections ?? 64);
 const repeat = Number(args.repeat ?? 3);
 
-const upstream = await startBenchUpstream(19001);
+await startBenchUpstream(19001); // stopped by stopAll()
 const agent = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 256 });
 const proxy = http.createServer((req, res) => {
   const out = http.request(
