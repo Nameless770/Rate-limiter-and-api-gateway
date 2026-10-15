@@ -13,7 +13,7 @@ RUN npm run build
 # The full test suite on Linux, including the POSIX-signal test that can't run on Windows.
 # Not part of the default build: `docker compose run --rm tests`.
 FROM build AS test
-COPY vitest.config.ts biome.json ./
+COPY vitest.config.ts biome.json gateway.config.json ./
 COPY test ./test
 CMD ["npx", "vitest", "run"]
 

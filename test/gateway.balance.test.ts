@@ -234,25 +234,29 @@ describe('visibility', () => {
 
 describe('upstream connection reuse', () => {
   it('keeps idle connections for reuse under concurrent load instead of closing and reopening them', async () => {
-    // 60 concurrent requests need about 60 connections. Every later wave must reuse them: a free-socket cap
-    // below the concurrency level makes each wave destroy and re-open the surplus, which at load exhausts
+    // A pool opens a new connection only when every existing one is busy, so the number of connections it has
+    // ever opened can never exceed the peak concurrency the upstream observed. A free-socket cap below the
+    // concurrency level breaks that: each wave destroys the surplus and re-opens it, which at load exhausts
     // ephemeral ports (TIME_WAIT) and wastes CPU on handshakes.
+    let concurrent = 0;
+    let peak = 0;
     const up = await upstream(async (_r, res) => {
+      concurrent++;
+      peak = Math.max(peak, concurrent);
       await sleep(25);
+      concurrent--;
       json(res, 200, { ok: true });
     });
     const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
     const wave = () => Promise.all(Array.from({ length: 60 }, () => get(g)));
 
-    await wave();
-    const afterFirst = up.connections();
-    expect(afterFirst).toBeLessThanOrEqual(62);
-
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 5; i++) {
       const statuses = (await wave()).map((r) => r.status);
       expect(statuses.every((s) => s === 200)).toBe(true);
     }
-    expect(up.connections() - afterFirst).toBeLessThanOrEqual(4); // not ~28 per wave
+
+    expect(peak).toBeGreaterThan(40); // concurrency really did exceed the old free-socket cap of 32
+    expect(up.connections()).toBeLessThanOrEqual(peak + 2); // never re-opened: the old cap opened ~28 more per wave
   });
 
   it('caps connections per target and queues the excess rather than refusing it', async () => {
