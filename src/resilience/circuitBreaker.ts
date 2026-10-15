@@ -81,7 +81,8 @@ interface Bucket {
 const BUCKETS_PER_WINDOW = 10;
 
 export class CircuitBreaker {
-  private readonly opts: Required<Omit<CircuitBreakerOptions, 'onStateChange'>> & Pick<CircuitBreakerOptions, 'onStateChange'>;
+  private readonly opts: Required<Omit<CircuitBreakerOptions, 'onStateChange'>> &
+    Pick<CircuitBreakerOptions, 'onStateChange'>;
   private readonly bucketMs: number;
   private buckets: Bucket[] = [];
 

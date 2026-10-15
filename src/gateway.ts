@@ -3,22 +3,28 @@ import { readFileSync } from 'node:fs';
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Redis } from 'ioredis';
-import { ResponseCache, type CachedResponse } from './cache/responseCache.js';
 import { requestCacheInfo, requestIsCacheSafe, storeDecision } from './cache/policy.js';
-import { ConfigError, type GatewayConfig, type RateLimitRuleConfig, type RouteConfig, type UpstreamConfig } from './config.js';
+import { type CachedResponse, ResponseCache } from './cache/responseCache.js';
+import {
+  ConfigError,
+  type GatewayConfig,
+  type RateLimitRuleConfig,
+  type RouteConfig,
+  type UpstreamConfig,
+} from './config.js';
 import { createLogger, type Logger } from './observability/logger.js';
 import { Registry } from './observability/metrics.js';
-import { stripHopByHop, sanitizeRequestId } from './proxy/headers.js';
+import { sanitizeRequestId, stripHopByHop } from './proxy/headers.js';
 import { UpstreamClient, UpstreamError, type UpstreamResponse } from './proxy/upstream.js';
 import { memorySlidingWindow, memoryTokenBucket } from './ratelimit/memory.js';
 import { RedisSlidingWindow, RedisTokenBucket } from './ratelimit/redis.js';
 import { ResilientRateLimiter } from './ratelimit/resilient.js';
 import {
-  RateLimiterUnavailableError,
   algorithmTag,
   type Clock,
   type RateLimitDecision,
   type RateLimiter,
+  RateLimiterUnavailableError,
 } from './ratelimit/types.js';
 import { CircuitBreaker, CircuitOpenError, type CircuitState } from './resilience/circuitBreaker.js';
 import { retry } from './resilience/retry.js';
@@ -234,7 +240,11 @@ export class Gateway {
     const keyPrefix = this.config.redis?.keyPrefix ?? 'gw:';
     const primary =
       rule.algorithm === 'token-bucket'
-        ? new RedisTokenBucket(this.redis, { capacity: rule.capacity, refillPerSecond: rule.refillPerSecond }, { keyPrefix })
+        ? new RedisTokenBucket(
+            this.redis,
+            { capacity: rule.capacity, refillPerSecond: rule.refillPerSecond },
+            { keyPrefix },
+          )
         : new RedisSlidingWindow(this.redis, { limit: rule.limit, windowMs: rule.windowMs }, { keyPrefix });
 
     return new ResilientRateLimiter(primary, {
@@ -248,8 +258,14 @@ export class Gateway {
   }
 
   private registerGauges(): void {
-    this.metrics.gauge('gateway_circuit_state', 'Circuit breaker state per upstream (0 closed, 1 half-open, 2 open).', () =>
-      [...this.upstreams.values()].map((u) => ({ labels: { upstream: u.name }, value: CIRCUIT_VALUE[u.breaker.state] })),
+    this.metrics.gauge(
+      'gateway_circuit_state',
+      'Circuit breaker state per upstream (0 closed, 1 half-open, 2 open).',
+      () =>
+        [...this.upstreams.values()].map((u) => ({
+          labels: { upstream: u.name },
+          value: CIRCUIT_VALUE[u.breaker.state],
+        })),
     );
     this.metrics.gauge('gateway_cache_entries', 'Entries held in the response cache.', () => [
       { labels: {}, value: this.cache.stats().entries },
@@ -331,7 +347,12 @@ export class Gateway {
   }
 
   /** Rate limiting. Returns false if the request was rejected (response already sent). */
-  private async admitted(req: IncomingMessage, res: ServerResponse, ctx: RequestContext, routeId: string): Promise<boolean> {
+  private async admitted(
+    req: IncomingMessage,
+    res: ServerResponse,
+    ctx: RequestContext,
+    routeId: string,
+  ): Promise<boolean> {
     const entry = this.limiters.get(routeId);
     if (!entry) return true;
 
@@ -568,7 +589,9 @@ export class Gateway {
 
     const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
     const priorFor = req.headers['x-forwarded-for'];
-    headers['x-forwarded-for'] = [Array.isArray(priorFor) ? priorFor.join(', ') : priorFor, remote].filter(Boolean).join(', ');
+    headers['x-forwarded-for'] = [Array.isArray(priorFor) ? priorFor.join(', ') : priorFor, remote]
+      .filter(Boolean)
+      .join(', ');
     if (req.headers['host']) headers['x-forwarded-host'] = String(req.headers['host']);
     headers['x-forwarded-proto'] ??= 'http';
 
@@ -755,7 +778,10 @@ export class Gateway {
       if (error.kind === 'timeout') this.sendError(res, ctx, 504, 'upstream_timeout', error.message);
       else this.sendError(res, ctx, 502, 'bad_gateway', error.message);
     } else {
-      this.logger.error('unhandled error', { requestId: ctx.requestId, error: (error as Error)?.stack ?? String(error) });
+      this.logger.error('unhandled error', {
+        requestId: ctx.requestId,
+        error: (error as Error)?.stack ?? String(error),
+      });
       this.sendError(res, ctx, 500, 'internal_error', 'internal server error');
     }
   }
@@ -764,7 +790,10 @@ export class Gateway {
     ctx.route = 'admin';
     if (pathname === '/_gateway/metrics') {
       const body = this.metrics.render();
-      res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'content-length': Buffer.byteLength(body) });
+      res.writeHead(200, {
+        'content-type': 'text/plain; version=0.0.4; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+      });
       res.end(body);
       return;
     }

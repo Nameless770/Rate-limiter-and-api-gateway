@@ -37,35 +37,35 @@ const retrySchema = z.strictObject({
   retryNonIdempotent: z.boolean().default(false),
 });
 
-const upstreamSchema = z.strictObject({
-  url: z
-    .url()
-    .refine((u) => /^https?:\/\//.test(u), 'must be an http(s) URL'),
-  /** Per-attempt time to first byte, and idle time afterwards. */
-  timeoutMs: positiveInt.default(5_000),
-  /**
-   * Overall deadline across all attempts and backoff sleeps. Without it a request can take
-   * maxAttempts x timeoutMs, which is usually longer than the client will wait and multiplies the load
-   * on an upstream that is already struggling. Unset means attempts are only bounded individually.
-   */
-  totalTimeoutMs: positiveInt.optional(),
-  retry: retrySchema.prefault({}),
-  breaker: breakerSchema.prefault({}),
-  tls: z
-    .strictObject({
-      /**
-       * PEM bundle for an upstream signed by a private CA (path relative to the working directory). It
-       * replaces the default trust store for this upstream only. There is deliberately no option to skip
-       * verification.
-       */
-      caFile: z.string().min(1),
-    })
-    .optional(),
-}).superRefine((upstream, ctx) => {
-  if (upstream.tls && !upstream.url.startsWith('https://')) {
-    ctx.addIssue({ code: 'custom', path: ['tls'], message: 'tls options require an https:// url' });
-  }
-});
+const upstreamSchema = z
+  .strictObject({
+    url: z.url().refine((u) => /^https?:\/\//.test(u), 'must be an http(s) URL'),
+    /** Per-attempt time to first byte, and idle time afterwards. */
+    timeoutMs: positiveInt.default(5_000),
+    /**
+     * Overall deadline across all attempts and backoff sleeps. Without it a request can take
+     * maxAttempts x timeoutMs, which is usually longer than the client will wait and multiplies the load
+     * on an upstream that is already struggling. Unset means attempts are only bounded individually.
+     */
+    totalTimeoutMs: positiveInt.optional(),
+    retry: retrySchema.prefault({}),
+    breaker: breakerSchema.prefault({}),
+    tls: z
+      .strictObject({
+        /**
+         * PEM bundle for an upstream signed by a private CA (path relative to the working directory). It
+         * replaces the default trust store for this upstream only. There is deliberately no option to skip
+         * verification.
+         */
+        caFile: z.string().min(1),
+      })
+      .optional(),
+  })
+  .superRefine((upstream, ctx) => {
+    if (upstream.tls && !upstream.url.startsWith('https://')) {
+      ctx.addIssue({ code: 'custom', path: ['tls'], message: 'tls options require an https:// url' });
+    }
+  });
 
 const routeCacheSchema = z.strictObject({
   /** Freshness lifetime used when the upstream doesn't send Cache-Control max-age / s-maxage. */
@@ -150,7 +150,11 @@ export const configSchema = z
       }
       seen.add(id);
       if (route.path.startsWith('/_gateway')) {
-        ctx.addIssue({ code: 'custom', path: ['routes', i, 'path'], message: '"/_gateway" is reserved for admin endpoints' });
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'path'],
+          message: '"/_gateway" is reserved for admin endpoints',
+        });
       }
     });
   });

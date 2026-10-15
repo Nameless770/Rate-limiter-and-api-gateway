@@ -1,14 +1,14 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   closedPort,
+  type FakeUpstream,
   fakeRedis,
   json,
+  type RunningGateway,
   rawGet,
   sleep,
   startGateway,
   startUpstream,
-  type FakeUpstream,
-  type RunningGateway,
   type UpstreamHandler,
 } from './helpers.js';
 
@@ -23,7 +23,10 @@ async function upstream(handler: Parameters<typeof startUpstream>[0]): Promise<F
   return u;
 }
 
-async function gateway(raw: Record<string, unknown>, deps?: Parameters<typeof startGateway>[1]): Promise<RunningGateway> {
+async function gateway(
+  raw: Record<string, unknown>,
+  deps?: Parameters<typeof startGateway>[1],
+): Promise<RunningGateway> {
   const g = await startGateway(raw, deps);
   cleanups.push(g.close);
   return g;
@@ -213,17 +216,26 @@ describe('rate limiting', () => {
     expect((await call('/b')).status).toBe(200); // separate budget
     for (let i = 0; i < 5; i++) expect((await call('/open')).status).toBe(200);
   });
-
 });
 
 describe('redis-backed limiting and failure modes', () => {
-  const route = { path: '/api', id: 'api', upstream: 'u', rateLimit: { algorithm: 'sliding-window', limit: 2, windowMs: 10_000 } };
+  const route = {
+    path: '/api',
+    id: 'api',
+    upstream: 'u',
+    rateLimit: { algorithm: 'sliding-window', limit: 2, windowMs: 10_000 },
+  };
 
   async function withRedis(failureMode: 'open' | 'closed' | 'local') {
     const up = await upstream(echo);
     const redis = fakeRedis();
     const g = await gateway(
-      { redis: { url: 'redis://unused', keyPrefix: 'test:' }, rateLimit: { failureMode }, upstreams: { u: { url: up.url } }, routes: [route] },
+      {
+        redis: { url: 'redis://unused', keyPrefix: 'test:' },
+        rateLimit: { failureMode },
+        upstreams: { u: { url: up.url } },
+        routes: [route],
+      },
       { redis: redis.client },
     );
     return { up, g, redis };
@@ -422,7 +434,10 @@ describe('retries', () => {
 
   it('retries 5xx on idempotent methods with exponential backoff and returns the eventual success', async () => {
     const up = await upstream((_r, res, _h, n) => (n < 3 ? json(res, 503, { n }) : json(res, 200, { ok: true, n })));
-    const g = await gateway({ upstreams: { u: { url: up.url, retry: fastRetry } }, routes: [{ path: '/', upstream: 'u' }] });
+    const g = await gateway({
+      upstreams: { u: { url: up.url, retry: fastRetry } },
+      routes: [{ path: '/', upstream: 'u' }],
+    });
 
     const res = await fetch(`${g.base}/flaky`);
     expect(res.status).toBe(200);
@@ -433,7 +448,10 @@ describe('retries', () => {
 
   it('hands back the last upstream response when retries are exhausted', async () => {
     const up = await upstream((_r, res, _h, n) => json(res, 503, { attempt: n }));
-    const g = await gateway({ upstreams: { u: { url: up.url, retry: fastRetry } }, routes: [{ path: '/', upstream: 'u' }] });
+    const g = await gateway({
+      upstreams: { u: { url: up.url, retry: fastRetry } },
+      routes: [{ path: '/', upstream: 'u' }],
+    });
     const res = await fetch(`${g.base}/down`);
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ attempt: 3 });
@@ -442,7 +460,10 @@ describe('retries', () => {
 
   it('does not retry POST on a 5xx, since it may already have taken effect', async () => {
     const up = await upstream((_r, res) => json(res, 503, {}));
-    const g = await gateway({ upstreams: { u: { url: up.url, retry: fastRetry } }, routes: [{ path: '/', upstream: 'u' }] });
+    const g = await gateway({
+      upstreams: { u: { url: up.url, retry: fastRetry } },
+      routes: [{ path: '/', upstream: 'u' }],
+    });
     const res = await fetch(`${g.base}/orders`, { method: 'POST', body: '{}' });
     expect(res.status).toBe(503);
     expect(up.hits).toHaveLength(1);
@@ -506,7 +527,12 @@ describe('timeouts', () => {
     });
     const g = await gateway({
       upstreams: {
-        u: { url: up.url, timeoutMs: 200, totalTimeoutMs: 500, retry: { maxAttempts: 10, baseDelayMs: 0, maxDelayMs: 1 } },
+        u: {
+          url: up.url,
+          timeoutMs: 200,
+          totalTimeoutMs: 500,
+          retry: { maxAttempts: 10, baseDelayMs: 0, maxDelayMs: 1 },
+        },
       },
       routes: [{ path: '/', upstream: 'u' }],
     });
@@ -542,7 +568,13 @@ describe('timeouts', () => {
 });
 
 describe('circuit breaker', () => {
-  const breaker = { failureRateThreshold: 0.5, minimumRequests: 4, windowMs: 10_000, openDurationMs: 5_000, halfOpenSuccesses: 2 };
+  const breaker = {
+    failureRateThreshold: 0.5,
+    minimumRequests: 4,
+    windowMs: 10_000,
+    openDurationMs: 5_000,
+    halfOpenSuccesses: 2,
+  };
 
   it('opens after repeated failures, fails fast, then probes and recovers', async () => {
     let healthy = false;
@@ -591,7 +623,11 @@ describe('circuit breaker', () => {
     const up = await upstream((_r, res) => json(res, 503, {}));
     const g = await gateway({
       upstreams: {
-        u: { url: up.url, retry: { maxAttempts: 10, baseDelayMs: 1, maxDelayMs: 1 }, breaker: { ...breaker, minimumRequests: 3 } },
+        u: {
+          url: up.url,
+          retry: { maxAttempts: 10, baseDelayMs: 1, maxDelayMs: 1 },
+          breaker: { ...breaker, minimumRequests: 3 },
+        },
       },
       routes: [{ path: '/', upstream: 'u' }],
     });

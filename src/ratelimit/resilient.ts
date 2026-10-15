@@ -12,7 +12,7 @@
  * A circuit breaker around the store means that once Redis is clearly unhealthy we stop paying its timeout
  * on every request and go straight to the fallback until it recovers.
  */
-import { CircuitBreaker, CircuitOpenError, type CircuitBreakerOptions } from '../resilience/circuitBreaker.js';
+import { CircuitBreaker, type CircuitBreakerOptions, CircuitOpenError } from '../resilience/circuitBreaker.js';
 import type { RateLimitDecision, RateLimiter } from './types.js';
 import { RateLimiterUnavailableError } from './types.js';
 

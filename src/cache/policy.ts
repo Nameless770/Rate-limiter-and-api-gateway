@@ -19,7 +19,13 @@ export function parseCacheControl(value: string | string[] | undefined): CacheDi
     if (eq === -1) {
       out.set(trimmed.toLowerCase(), true);
     } else {
-      out.set(trimmed.slice(0, eq).trim().toLowerCase(), trimmed.slice(eq + 1).trim().replace(/^"|"$/g, ''));
+      out.set(
+        trimmed.slice(0, eq).trim().toLowerCase(),
+        trimmed
+          .slice(eq + 1)
+          .trim()
+          .replace(/^"|"$/g, ''),
+      );
     }
   }
   return out;

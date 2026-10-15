@@ -10,7 +10,10 @@ export interface Logger {
 }
 
 /** One JSON object per line on stdout: trivially ingestible by any log pipeline. */
-export function createLogger(level: LogLevel = 'info', write: (line: string) => void = (l) => process.stdout.write(l)): Logger {
+export function createLogger(
+  level: LogLevel = 'info',
+  write: (line: string) => void = (l) => process.stdout.write(l),
+): Logger {
   const threshold = ORDER[level];
   const emit =
     (lvl: Exclude<LogLevel, 'silent'>) =>

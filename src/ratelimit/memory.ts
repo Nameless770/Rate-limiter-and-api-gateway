@@ -3,13 +3,13 @@
  * also the degraded-mode fallback when Redis is unreachable (see resilient.ts).
  */
 import {
+  type SlidingWindowParams,
   slidingWindowIsExpired,
   slidingWindowStep,
-  tokenBucketIsExpired,
-  tokenBucketStep,
-  type SlidingWindowParams,
   type TokenBucketParams,
   type TokenBucketState,
+  tokenBucketIsExpired,
+  tokenBucketStep,
 } from './algorithms.js';
 import type { Clock, RateLimitDecision, RateLimiter } from './types.js';
 
@@ -96,7 +96,10 @@ class MemoryRateLimiter<S> implements RateLimiter {
   }
 }
 
-export function memoryTokenBucket(params: TokenBucketParams, options?: MemoryLimiterOptions): MemoryRateLimiter<TokenBucketState> {
+export function memoryTokenBucket(
+  params: TokenBucketParams,
+  options?: MemoryLimiterOptions,
+): MemoryRateLimiter<TokenBucketState> {
   return new MemoryRateLimiter<TokenBucketState>(
     {
       limit: params.capacity,
@@ -108,7 +111,10 @@ export function memoryTokenBucket(params: TokenBucketParams, options?: MemoryLim
   );
 }
 
-export function memorySlidingWindow(params: SlidingWindowParams, options?: MemoryLimiterOptions): MemoryRateLimiter<number[]> {
+export function memorySlidingWindow(
+  params: SlidingWindowParams,
+  options?: MemoryLimiterOptions,
+): MemoryRateLimiter<number[]> {
   return new MemoryRateLimiter<number[]>(
     {
       limit: params.limit,

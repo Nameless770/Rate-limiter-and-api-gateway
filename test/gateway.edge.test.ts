@@ -2,22 +2,23 @@
  * The paths that are easy to get subtly wrong in a proxy: HEAD, chunked uploads, an upstream dying mid-body,
  * HTTPS upstreams, clients leaving during a coalesced cache fetch, and shutting down with requests in flight.
  */
-import http from 'node:http';
+
 import { readFileSync } from 'node:fs';
+import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseConfig } from '../src/config.js';
 import { Gateway } from '../src/gateway.js';
 import { silentLogger } from '../src/observability/logger.js';
 import {
   capturingLogger,
+  type FakeUpstream,
   fixture,
   json,
+  type RunningGateway,
   rawRequest,
   sleep,
   startGateway,
   startUpstream,
-  type FakeUpstream,
-  type RunningGateway,
   type UpstreamHandler,
   type UpstreamOptions,
 } from './helpers.js';
@@ -33,7 +34,10 @@ async function upstream(handler: UpstreamHandler, options?: UpstreamOptions): Pr
   return u;
 }
 
-async function gateway(raw: Record<string, unknown>, deps?: Parameters<typeof startGateway>[1]): Promise<RunningGateway> {
+async function gateway(
+  raw: Record<string, unknown>,
+  deps?: Parameters<typeof startGateway>[1],
+): Promise<RunningGateway> {
   const g = await startGateway(raw, deps);
   cleanups.push(g.close);
   return g;
@@ -42,12 +46,16 @@ async function gateway(raw: Record<string, unknown>, deps?: Parameters<typeof st
 const echo: UpstreamHandler = (_req, res, hit) =>
   json(res, 200, { method: hit.method, url: hit.url, body: hit.body, headers: hit.headers });
 
-const errorCode = async (res: Response): Promise<string> => ((await res.json()) as { error: { code: string } }).error.code;
+const errorCode = async (res: Response): Promise<string> =>
+  ((await res.json()) as { error: { code: string } }).error.code;
 
 describe('HEAD requests', () => {
   it('relay the upstream headers with no body, and never touch the cache', async () => {
     const up = await upstream((_r, res, hit) => json(res, 200, { method: hit.method, padding: 'x'.repeat(64) }));
-    const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u', cache: { ttlMs: 30_000 } }] });
+    const g = await gateway({
+      upstreams: { u: { url: up.url } },
+      routes: [{ path: '/', upstream: 'u', cache: { ttlMs: 30_000 } }],
+    });
 
     const head = await fetch(`${g.base}/thing`, { method: 'HEAD' });
     expect(head.status).toBe(200);
@@ -76,7 +84,12 @@ describe('chunked request bodies', () => {
     const up = await upstream(echo);
     const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
 
-    const res = await rawRequest(g.base, { method: 'POST', path: '/upload', chunks: ['hello ', 'chunked ', 'world'], chunkDelayMs: 10 });
+    const res = await rawRequest(g.base, {
+      method: 'POST',
+      path: '/upload',
+      chunks: ['hello ', 'chunked ', 'world'],
+      chunkDelayMs: 10,
+    });
 
     expect(res.status).toBe(200);
     expect(up.hits[0]?.body).toBe('hello chunked world');
@@ -87,14 +100,23 @@ describe('chunked request bodies', () => {
   it('are replayed intact on retry', async () => {
     const up = await upstream((_r, res, _hit, n) => json(res, n === 1 ? 503 : 200, {}));
     const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
-    const res = await rawRequest(g.base, { method: 'PUT', path: '/doc', chunks: ['part-1;', 'part-2'], chunkDelayMs: 5 });
+    const res = await rawRequest(g.base, {
+      method: 'PUT',
+      path: '/doc',
+      chunks: ['part-1;', 'part-2'],
+      chunkDelayMs: 5,
+    });
     expect(res.status).toBe(200);
     expect(up.hits.map((h) => h.body)).toEqual(['part-1;part-2', 'part-1;part-2']);
   });
 
   it('get a 413, not a dropped connection, when they outgrow the limit without declaring a length', async () => {
     const up = await upstream(echo);
-    const g = await gateway({ maxBodyBytes: 16, upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
+    const g = await gateway({
+      maxBodyBytes: 16,
+      upstreams: { u: { url: up.url } },
+      routes: [{ path: '/', upstream: 'u' }],
+    });
 
     const res = await rawRequest(g.base, {
       method: 'POST',
@@ -136,34 +158,40 @@ describe('an upstream dying mid-body', () => {
   it.each([
     ['with Content-Length', true],
     ['chunked', false],
-  ])('%s: the client sees a broken response rather than a short one, and nothing is cached', async (_name, withLength) => {
-    const up = await upstream((_r, res) => {
-      res.writeHead(200, { 'content-type': 'text/plain', ...(withLength ? { 'content-length': '100' } : {}) });
-      res.write('partial-body');
-      setTimeout(() => res.socket?.destroy(), 20);
-    });
-    const g = await gateway({
-      upstreams: { u: { url: up.url, retry: { maxAttempts: 1 } } },
-      routes: [{ path: '/', upstream: 'u', id: 'files', cache: { ttlMs: 30_000 } }],
-    });
+  ])(
+    '%s: the client sees a broken response rather than a short one, and nothing is cached',
+    async (_name, withLength) => {
+      const up = await upstream((_r, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain', ...(withLength ? { 'content-length': '100' } : {}) });
+        res.write('partial-body');
+        setTimeout(() => res.socket?.destroy(), 20);
+      });
+      const g = await gateway({
+        upstreams: { u: { url: up.url, retry: { maxAttempts: 1 } } },
+        routes: [{ path: '/', upstream: 'u', id: 'files', cache: { ttlMs: 30_000 } }],
+      });
 
-    const first = await rawRequest(g.base, { path: '/file' });
-    expect(first.status).toBe(200); // the status line had already gone out...
-    expect(first.complete).toBe(false); // ...but the body is visibly broken, not silently short
-    expect('partial-body'.startsWith(first.body)).toBe(true);
+      const first = await rawRequest(g.base, { path: '/file' });
+      expect(first.status).toBe(200); // the status line had already gone out...
+      expect(first.complete).toBe(false); // ...but the body is visibly broken, not silently short
+      expect('partial-body'.startsWith(first.body)).toBe(true);
 
-    const second = await rawRequest(g.base, { path: '/file' });
-    expect(second.headers['x-cache']).toBe('MISS'); // the truncated body was never stored
-    expect(up.hits).toHaveLength(2);
+      const second = await rawRequest(g.base, { path: '/file' });
+      expect(second.headers['x-cache']).toBe('MISS'); // the truncated body was never stored
+      expect(up.hits).toHaveLength(2);
 
-    await sleep(20);
-    const metrics = await (await fetch(`${g.base}/_gateway/metrics`)).text();
-    expect(metrics).toMatch(/gateway_requests_total\{route="files",status="502"\} 2/); // counted as gateway errors, not 200s
-  });
+      await sleep(20);
+      const metrics = await (await fetch(`${g.base}/_gateway/metrics`)).text();
+      expect(metrics).toMatch(/gateway_requests_total\{route="files",status="502"\} 2/); // counted as gateway errors, not 200s
+    },
+  );
 });
 
 describe('HTTPS upstreams', () => {
-  const tls = { key: readFileSync(fixture('tls/localhost-key.pem')), cert: readFileSync(fixture('tls/localhost-cert.pem')) };
+  const tls = {
+    key: readFileSync(fixture('tls/localhost-key.pem')),
+    cert: readFileSync(fixture('tls/localhost-cert.pem')),
+  };
 
   it('are proxied when their certificate chains to the configured CA', async () => {
     const up = await upstream(echo, { tls });
@@ -254,7 +282,10 @@ describe('coalesced cache fetches when clients leave', () => {
       req.on('error', () => {});
     });
     await sleep(40);
-    const waiters = Array.from({ length: 3 }, async () => (await (await fetch(`${g.base}/big`)).json()) as { n: number; filler: string });
+    const waiters = Array.from(
+      { length: 3 },
+      async () => (await (await fetch(`${g.base}/big`)).json()) as { n: number; filler: string },
+    );
     await leaderGotBytes;
 
     const bodies = await Promise.all(waiters);

@@ -55,8 +55,7 @@ describe.skipIf(process.platform === 'win32')('process lifecycle (POSIX signals)
       let buffered = '';
       child.stdout.on('data', (d: Buffer) => {
         buffered += d.toString();
-        let newline: number;
-        while ((newline = buffered.indexOf('\n')) >= 0) {
+        for (let newline = buffered.indexOf('\n'); newline >= 0; newline = buffered.indexOf('\n')) {
           const line = buffered.slice(0, newline);
           buffered = buffered.slice(newline + 1);
           try {

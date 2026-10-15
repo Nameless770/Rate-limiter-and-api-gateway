@@ -18,7 +18,9 @@ function setup(overrides: Partial<ConstructorParameters<typeof CircuitBreaker>[0
   return {
     breaker,
     transitions,
-    advance: (ms: number) => void (now += ms),
+    advance: (ms: number) => {
+      now += ms;
+    },
     call: (ok: boolean) => {
       const permit = breaker.tryAcquire();
       if (!permit) return false;

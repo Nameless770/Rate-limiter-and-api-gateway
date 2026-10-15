@@ -49,13 +49,20 @@ describe('parseConfig', () => {
   });
 
   it('rejects a route pointing at an upstream that does not exist', () => {
-    expect(() => parseConfig({ ...minimal, routes: [{ path: '/x', upstream: 'nope' }] })).toThrow(/unknown upstream "nope"/);
+    expect(() => parseConfig({ ...minimal, routes: [{ path: '/x', upstream: 'nope' }] })).toThrow(
+      /unknown upstream "nope"/,
+    );
   });
 
   it('rejects typos instead of silently ignoring them', () => {
     expect(() => parseConfig({ ...minimal, prot: 9000 })).toThrow(ConfigError);
     expect(() =>
-      parseConfig({ ...minimal, routes: [{ path: '/x', upstream: 'users', rateLimit: { algorithm: 'sliding-window', limt: 5, windowMs: 1000 } }] }),
+      parseConfig({
+        ...minimal,
+        routes: [
+          { path: '/x', upstream: 'users', rateLimit: { algorithm: 'sliding-window', limt: 5, windowMs: 1000 } },
+        ],
+      }),
     ).toThrow(ConfigError);
   });
 
@@ -69,23 +76,36 @@ describe('parseConfig', () => {
 
   it('rejects duplicate route ids and the reserved admin prefix', () => {
     expect(() =>
-      parseConfig({ ...minimal, routes: [{ path: '/a', upstream: 'users' }, { path: '/b', id: '/a', upstream: 'users' }] }),
+      parseConfig({
+        ...minimal,
+        routes: [
+          { path: '/a', upstream: 'users' },
+          { path: '/b', id: '/a', upstream: 'users' },
+        ],
+      }),
     ).toThrow(/duplicate route id/);
     expect(() => parseConfig({ ...minimal, routes: [{ path: '/_gateway/x', upstream: 'users' }] })).toThrow(/reserved/);
   });
 
   it('only accepts tls options for https upstreams', () => {
     expect(() =>
-      parseConfig({ upstreams: { u: { url: 'http://svc', tls: { caFile: 'ca.pem' } } }, routes: [{ path: '/', upstream: 'u' }] }),
+      parseConfig({
+        upstreams: { u: { url: 'http://svc', tls: { caFile: 'ca.pem' } } },
+        routes: [{ path: '/', upstream: 'u' }],
+      }),
     ).toThrow(/upstreams\.u\.tls: tls options require an https:\/\/ url/);
     expect(
-      parseConfig({ upstreams: { u: { url: 'https://svc', tls: { caFile: 'ca.pem' } } }, routes: [{ path: '/', upstream: 'u' }] })
-        .upstreams['u']?.tls,
+      parseConfig({
+        upstreams: { u: { url: 'https://svc', tls: { caFile: 'ca.pem' } } },
+        routes: [{ path: '/', upstream: 'u' }],
+      }).upstreams['u']?.tls,
     ).toEqual({ caFile: 'ca.pem' });
   });
 
   it('only allows http(s) upstreams', () => {
-    expect(() => parseConfig({ upstreams: { u: { url: 'ftp://example.com' } }, routes: [{ path: '/', upstream: 'u' }] })).toThrow();
+    expect(() =>
+      parseConfig({ upstreams: { u: { url: 'ftp://example.com' } }, routes: [{ path: '/', upstream: 'u' }] }),
+    ).toThrow();
   });
 
   it('reports every problem with its path', () => {

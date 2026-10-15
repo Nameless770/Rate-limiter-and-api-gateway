@@ -72,9 +72,9 @@ export class Histogram {
       s = { counts: new Array<number>(this.buckets.length).fill(0), sum: 0, count: 0 };
       this.series.set(key, s);
     }
-    this.buckets.forEach((upper, i) => {
-      if (value <= upper) (s as { counts: number[] }).counts[i]!++;
-    });
+    for (let i = 0; i < this.buckets.length; i++) {
+      if (value <= (this.buckets[i] as number)) s.counts[i] = (s.counts[i] ?? 0) + 1;
+    }
     s.sum += value;
     s.count++;
   }
@@ -83,7 +83,9 @@ export class Histogram {
     const out = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} histogram`];
     for (const [key, s] of this.series) {
       const prefix = key ? `${key},` : '';
-      this.buckets.forEach((upper, i) => out.push(line(`${this.name}_bucket`, `${prefix}le="${upper}"`, s.counts[i] ?? 0)));
+      for (let i = 0; i < this.buckets.length; i++) {
+        out.push(line(`${this.name}_bucket`, `${prefix}le="${this.buckets[i]}"`, s.counts[i] ?? 0));
+      }
       out.push(line(`${this.name}_bucket`, `${prefix}le="+Inf"`, s.count));
       out.push(line(`${this.name}_sum`, key, s.sum));
       out.push(line(`${this.name}_count`, key, s.count));

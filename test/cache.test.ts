@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseCacheControl, requestCacheInfo, requestIsCacheSafe, storeDecision } from '../src/cache/policy.js';
-import { ResponseCache, type CachedResponse } from '../src/cache/responseCache.js';
+import { type CachedResponse, ResponseCache } from '../src/cache/responseCache.js';
 
 describe('parseCacheControl', () => {
   it('parses flags and valued directives case-insensitively', () => {

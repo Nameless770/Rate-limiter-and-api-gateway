@@ -20,7 +20,10 @@ describe('Router', () => {
   });
 
   it('prefers the most specific prefix regardless of config order', () => {
-    const r = router([{ path: '/api', id: 'general' }, { path: '/api/orders', id: 'orders' }]);
+    const r = router([
+      { path: '/api', id: 'general' },
+      { path: '/api/orders', id: 'orders' },
+    ]);
     expect(r.match('/api/orders/7', 'GET')?.routeId).toBe('orders');
     expect(r.match('/api/other', 'GET')?.routeId).toBe('general');
   });

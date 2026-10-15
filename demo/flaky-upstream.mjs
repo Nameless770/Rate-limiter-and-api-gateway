@@ -17,7 +17,11 @@ let latencyMs = 0;
 
 const send = (res, status, body, headers = {}) => {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), ...headers });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(payload),
+    ...headers,
+  });
   res.end(payload);
 };
 
@@ -51,7 +55,13 @@ const server = http.createServer(async (req, res) => {
     case '/flaky':
       return Math.random() < 0.5 ? send(res, 503, { error: 'flaky', call: n }) : send(res, 200, { ok: true, call: n });
     default:
-      return send(res, 200, { call: n, method: req.method, path: url.pathname, query: url.search, headers: req.headers });
+      return send(res, 200, {
+        call: n,
+        method: req.method,
+        path: url.pathname,
+        query: url.search,
+        headers: req.headers,
+      });
   }
 });
 

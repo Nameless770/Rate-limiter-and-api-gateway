@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  slidingWindowStep,
-  tokenBucketStep,
-  type TokenBucketState,
-} from '../src/ratelimit/algorithms.js';
+import { slidingWindowStep, type TokenBucketState, tokenBucketStep } from '../src/ratelimit/algorithms.js';
 import { memorySlidingWindow, memoryTokenBucket } from '../src/ratelimit/memory.js';
 
 /** Drive the pure token bucket through a list of (time, cost) calls. */
@@ -20,7 +16,10 @@ describe('token bucket', () => {
   const params = { capacity: 5, refillPerSecond: 10 }; // 1 token per 100ms
 
   it('starts full and allows a burst up to capacity, then denies', () => {
-    const decisions = runBucket(params, Array.from({ length: 7 }, () => [0] as [number]));
+    const decisions = runBucket(
+      params,
+      Array.from({ length: 7 }, () => [0] as [number]),
+    );
     expect(decisions.map((d) => d.allowed)).toEqual([true, true, true, true, true, false, false]);
     expect(decisions.map((d) => d.remaining)).toEqual([4, 3, 2, 1, 0, 0, 0]);
   });
@@ -44,7 +43,11 @@ describe('token bucket', () => {
   });
 
   it('supports weighted requests', () => {
-    const d = runBucket(params, [[0, 3], [0, 3], [0, 2]]);
+    const d = runBucket(params, [
+      [0, 3],
+      [0, 3],
+      [0, 2],
+    ]);
     expect(d.map((x) => x.allowed)).toEqual([true, false, true]);
     expect(d[1]?.retryAfterMs).toBe(100); // has 2, needs 3
   });
@@ -150,7 +153,10 @@ describe('in-memory limiters', () => {
 
   it('sweeps keys whose state is indistinguishable from a fresh one', async () => {
     let now = 0;
-    const limiter = memoryTokenBucket({ capacity: 2, refillPerSecond: 1 }, { clock: () => now, maxKeys: 3, sweepIntervalMs: 0 });
+    const limiter = memoryTokenBucket(
+      { capacity: 2, refillPerSecond: 1 },
+      { clock: () => now, maxKeys: 3, sweepIntervalMs: 0 },
+    );
     await limiter.consume('a');
     await limiter.consume('b');
     await limiter.consume('c');

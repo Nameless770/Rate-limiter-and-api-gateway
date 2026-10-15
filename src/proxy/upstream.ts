@@ -134,7 +134,10 @@ export class UpstreamClient {
 function classify(error: unknown): UpstreamError {
   if (error instanceof UpstreamError) return error;
   const code = (error as NodeJS.ErrnoException).code;
-  if (code && CONNECT_CODES.has(code)) return new UpstreamError('connect', `cannot connect to upstream (${code})`, { cause: error });
+  if (code && CONNECT_CODES.has(code))
+    return new UpstreamError('connect', `cannot connect to upstream (${code})`, { cause: error });
   if (code && TLS_CODE.test(code)) return new UpstreamError('tls', `upstream TLS failed (${code})`, { cause: error });
-  return new UpstreamError('reset', `upstream connection failed (${code ?? (error as Error).message})`, { cause: error });
+  return new UpstreamError('reset', `upstream connection failed (${code ?? (error as Error).message})`, {
+    cause: error,
+  });
 }

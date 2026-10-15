@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.js';
 import { Gateway, type GatewayDeps } from '../src/gateway.js';
-import { createLogger, silentLogger, type Logger } from '../src/observability/logger.js';
+import { createLogger, type Logger, silentLogger } from '../src/observability/logger.js';
 
 /** Absolute path of a file under test/fixtures. */
 export const fixture = (relative: string): string => fileURLToPath(new URL(`./fixtures/${relative}`, import.meta.url));
@@ -23,7 +23,12 @@ export interface FakeUpstream {
   close(): Promise<void>;
 }
 
-export type UpstreamHandler = (req: IncomingMessage, res: ServerResponse, hit: Hit, hitNumber: number) => void | Promise<void>;
+export type UpstreamHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  hit: Hit,
+  hitNumber: number,
+) => void | Promise<void>;
 
 export interface UpstreamOptions {
   /** Serve HTTPS with this key and certificate instead of plain HTTP. */
@@ -66,7 +71,11 @@ export async function startUpstream(handler: UpstreamHandler, options: UpstreamO
 
 export function json(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), ...headers });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(payload),
+    ...headers,
+  });
   res.end(payload);
 }
 
@@ -76,7 +85,11 @@ export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeou
  * GET with the request target sent exactly as given. `fetch` normalizes dot-segments before sending, so it
  * can't exercise how the server treats a hostile path.
  */
-export function rawGet(base: string, path: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+export function rawGet(
+  base: string,
+  path: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: string }> {
   const { hostname, port } = new URL(base);
   return new Promise((resolve, reject) => {
     const req = http.request({ hostname, port, path, method: 'GET', headers }, (res) => {
@@ -118,14 +131,26 @@ export function rawRequest(
   return new Promise((resolve, reject) => {
     let responded = false;
     const req = http.request(
-      { hostname, port, path: opts.path, method: opts.method ?? 'GET', headers: opts.headers, agent: opts.agent ?? false },
+      {
+        hostname,
+        port,
+        path: opts.path,
+        method: opts.method ?? 'GET',
+        headers: opts.headers,
+        agent: opts.agent ?? false,
+      },
       (res) => {
         responded = true;
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
         res.on('error', () => {}); // a body cut short surfaces below as complete === false
         res.on('close', () =>
-          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks).toString(), complete: res.complete }),
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString(),
+            complete: res.complete,
+          }),
         );
       },
     );
@@ -146,7 +171,10 @@ export function rawRequest(
 /** A logger that keeps every line, so tests can assert nothing was logged at error level. */
 export function capturingLogger(): { logger: Logger; lines: Array<Record<string, unknown>> } {
   const lines: Array<Record<string, unknown>> = [];
-  return { logger: createLogger('debug', (line) => void lines.push(JSON.parse(line) as Record<string, unknown>)), lines };
+  return {
+    logger: createLogger('debug', (line) => void lines.push(JSON.parse(line) as Record<string, unknown>)),
+    lines,
+  };
 }
 
 /**
@@ -187,7 +215,9 @@ export interface TestClock {
 export function fakeClock(start = 1_700_000_000_000): TestClock {
   let now = start;
   const clock = (() => now) as TestClock;
-  clock.advance = (ms: number) => void (now += ms);
+  clock.advance = (ms: number) => {
+    now += ms;
+  };
   return clock;
 }
 

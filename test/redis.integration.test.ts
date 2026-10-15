@@ -6,8 +6,8 @@
  */
 import { Redis } from 'ioredis';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { RedisSlidingWindow, RedisTokenBucket } from '../src/ratelimit/redis.js';
 import { memorySlidingWindow, memoryTokenBucket } from '../src/ratelimit/memory.js';
+import { RedisSlidingWindow, RedisTokenBucket } from '../src/ratelimit/redis.js';
 import type { RateLimitDecision } from '../src/ratelimit/types.js';
 
 const url = process.env['REDIS_URL'];
@@ -97,23 +97,30 @@ describe.skipIf(!url)('redis limiters (integration)', () => {
   describe('atomicity across independent clients', () => {
     it('sliding window admits exactly `limit` out of a concurrent flood from several instances', async () => {
       const limit = 50;
-      const instances = Array.from({ length: 4 }, () =>
-        new RedisSlidingWindow(connect(), { limit, windowMs: 60_000 }, { keyPrefix: prefix }),
+      const instances = Array.from(
+        { length: 4 },
+        () => new RedisSlidingWindow(connect(), { limit, windowMs: 60_000 }, { keyPrefix: prefix }),
       );
       const results = await Promise.all(
-        Array.from({ length: 400 }, (_, i) => (instances[i % instances.length] as RedisSlidingWindow).consume('flood-sw')),
+        Array.from({ length: 400 }, (_, i) =>
+          (instances[i % instances.length] as RedisSlidingWindow).consume('flood-sw'),
+        ),
       );
       expect(results.filter((r) => r.allowed)).toHaveLength(limit);
     });
 
     it('token bucket admits exactly `capacity` out of a concurrent flood from several instances', async () => {
       const capacity = 30;
-      const instances = Array.from({ length: 4 }, () =>
-        // Refill so slow that no token can appear during the test.
-        new RedisTokenBucket(connect(), { capacity, refillPerSecond: 0.0001 }, { keyPrefix: prefix }),
+      const instances = Array.from(
+        { length: 4 },
+        () =>
+          // Refill so slow that no token can appear during the test.
+          new RedisTokenBucket(connect(), { capacity, refillPerSecond: 0.0001 }, { keyPrefix: prefix }),
       );
       const results = await Promise.all(
-        Array.from({ length: 300 }, (_, i) => (instances[i % instances.length] as RedisTokenBucket).consume('flood-tb')),
+        Array.from({ length: 300 }, (_, i) =>
+          (instances[i % instances.length] as RedisTokenBucket).consume('flood-tb'),
+        ),
       );
       expect(results.filter((r) => r.allowed)).toHaveLength(capacity);
     });
