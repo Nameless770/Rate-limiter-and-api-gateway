@@ -144,6 +144,11 @@ describe('redis and limits', () => {
     expect(cfg.rateLimit.ipv6Prefix).toBe(64);
   });
 
+  it('does not cap connections per address by default: a load balancer opens them all from one', () => {
+    expect(config({}).limits.maxConnectionsPerIp).toBe(0);
+    expect(config({ limits: { maxConnectionsPerIp: 50 } }).limits.maxConnectionsPerIp).toBe(50);
+  });
+
   it('upper-cases configured methods', () => {
     expect(config({ allowedMethods: ['get', 'post'] }).allowedMethods).toEqual(['GET', 'POST']);
   });

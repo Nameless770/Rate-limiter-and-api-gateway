@@ -233,7 +233,7 @@ export class Gateway {
     this.startedAt = this.clock();
     this.allowedMethods = new Set(config.allowedMethods);
     this.identities = new IdentityResolver(config.rateLimit);
-    this.maxConnectionsPerIp = config.limits.maxConnectionsPerIp ?? (config.rateLimit.trustedProxyHops === 0 ? 256 : 0);
+    this.maxConnectionsPerIp = config.limits.maxConnectionsPerIp;
     if (config.admin.token !== undefined) {
       this.adminTokenDigest = createHash('sha256').update(config.admin.token).digest();
     }

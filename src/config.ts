@@ -249,10 +249,13 @@ export const configSchema = z
         /** Hard cap on open client connections. */
         maxConnections: positiveInt.default(10_000),
         /**
-         * Open connections allowed per client address. Unset means 256 when the gateway is the edge and off
-         * when it sits behind trusted proxies (every connection then comes from the proxy). 0 disables.
+         * Open connections allowed per client address; 0 (the default) means no per-address cap.
+         *
+         * It is off by default because a load balancer or CDN opens all of its connections from one address:
+         * a cap that suits individual clients would throttle the whole deployment. Set it (a few hundred is
+         * typical) only when clients connect to the gateway directly. `maxConnections` always applies.
          */
-        maxConnectionsPerIp: z.number().int().min(0).optional(),
+        maxConnectionsPerIp: z.number().int().min(0).default(0),
         /** Requests being processed at once; beyond this the gateway sheds load with 503. */
         maxInFlight: positiveInt.default(2_000),
         /** Total request-body bytes held in memory across all in-flight requests. */

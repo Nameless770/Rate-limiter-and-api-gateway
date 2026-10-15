@@ -185,7 +185,7 @@ What the gateway defends, and how. Everything here has a test; the table points 
 | Request smuggling / ambiguous framing | Node's strict parser rejects conflicting lengths, obfuscated `Transfer-Encoding`, folding, bare LF, control chars; nothing ambiguous is forwarded | `hardening.test.ts` |
 | Header injection via path/query | Encoded CR/LF stays inert data | `hardening.test.ts` |
 | SSRF through an absolute-form request target | Only the path is used; the gateway never connects where the client points | `hardening.test.ts`, `gateway.e2e.test.ts` |
-| Slowloris, connection floods | `headersTimeoutMs`, `requestTimeoutMs`, `maxConnections`, per-address connection cap | `gateway.security.test.ts`, `hardening.test.ts` |
+| Slowloris, connection floods | `headersTimeoutMs`, `requestTimeoutMs`, `maxConnections`, and an opt-in per-address connection cap (off by default: a load balancer shares one address) | `gateway.security.test.ts`, `hardening.test.ts` |
 | Memory exhaustion | `maxInFlight` (503 when exceeded), `maxBufferedBytes` across all in-flight bodies, `maxBodyBytes`, bounded limiter key space, bounded cache | `gateway.security.test.ts`, soak test |
 | Information disclosure in errors | Generic client-facing errors with a request id; detail logged against that id | `gateway.security.test.ts` |
 | Unsafe methods | Allowlist (default excludes `TRACE`/`CONNECT`) with `405` + `Allow` | `gateway.security.test.ts` |
@@ -224,7 +224,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `rateLimit` | `default`, `ip` | none | Default rule for routes; per-address ceiling across routes |
 | `rateLimit` | `apiKeys`, `plans`, `requireKey`, `anonymousMultiplier` | `[]`, `{}`, `false`, `1` | Key registry (see above) |
 | `rateLimit` | `ipv6Prefix` | `64` | IPv6 grouping |
-| `limits` | `maxConnections`, `maxConnectionsPerIp` | `10000`, 256 as the edge / off behind proxies | Connection caps |
+| `limits` | `maxConnections`, `maxConnectionsPerIp` | `10000`, `0` (off) | Connection caps. The per-address cap is off by default because a load balancer opens every connection from one address; set it when clients connect to the gateway directly |
 | `limits` | `maxInFlight`, `maxBufferedBytes` | `2000`, 64 MiB | Load shedding (503) |
 | `limits` | `maxHeaderBytes`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs` | `16384`, `15000`, `60000`, `65000` | Protocol limits |
 | `upstreams.*` | `url` **or** `urls`, `balance` | `-`, `round-robin` | One backend, or several |
