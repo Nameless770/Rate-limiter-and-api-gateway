@@ -66,15 +66,19 @@ export async function startBenchUpstream(port) {
 }
 
 /** Start the compiled gateway (run `npm run build` first) with a generated config. */
-export async function startBenchGateway(config, { logLevel = 'warn', logToFile } = {}) {
+export async function startBenchGateway(config, { logLevel = 'warn' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'gw-bench-'));
   const configPath = join(dir, 'gateway.json');
   writeFileSync(configPath, JSON.stringify(config));
-  const child = spawn(process.execPath, [join(projectRoot, process.env.GATEWAY_DIST ?? 'dist', 'index.js'), configPath], {
-    cwd: projectRoot,
-    env: { ...process.env, LOG_LEVEL: logLevel, PORT: undefined, REDIS_URL: undefined },
-    stdio: ['ignore', logToFile ? 'ignore' : 'ignore', 'pipe'],
-  });
+  const child = spawn(
+    process.execPath,
+    [join(projectRoot, process.env.GATEWAY_DIST ?? 'dist', 'index.js'), configPath],
+    {
+      cwd: projectRoot,
+      env: { ...process.env, LOG_LEVEL: logLevel, PORT: undefined, REDIS_URL: undefined },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    },
+  );
   let stderr = '';
   child.stderr.on('data', (d) => {
     stderr += d.toString();
