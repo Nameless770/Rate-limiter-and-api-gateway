@@ -48,10 +48,11 @@ export class Gauge {
     readonly name: string,
     readonly help: string,
     private readonly collect: () => Array<{ labels: Labels; value: number }>,
+    private readonly kind: 'gauge' | 'counter' = 'gauge',
   ) {}
 
   render(): string[] {
-    const out = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} gauge`];
+    const out = [`# HELP ${this.name} ${this.help}`, `# TYPE ${this.name} ${this.kind}`];
     for (const { labels, value } of this.collect()) out.push(line(this.name, labelKey(labels), value));
     return out;
   }
@@ -103,8 +104,14 @@ export class Registry {
     return c;
   }
 
-  gauge(name: string, help: string, collect: () => Array<{ labels: Labels; value: number }>): Gauge {
-    const g = new Gauge(name, help, collect);
+  /** A metric whose value is read from `collect` at scrape time. `kind` is what Prometheus is told it is. */
+  gauge(
+    name: string,
+    help: string,
+    collect: () => Array<{ labels: Labels; value: number }>,
+    kind: 'gauge' | 'counter' = 'gauge',
+  ): Gauge {
+    const g = new Gauge(name, help, collect, kind);
     this.metrics.push(g);
     return g;
   }

@@ -93,7 +93,7 @@ describe('parseConfig', () => {
         upstreams: { u: { url: 'http://svc', tls: { caFile: 'ca.pem' } } },
         routes: [{ path: '/', upstream: 'u' }],
       }),
-    ).toThrow(/upstreams\.u\.tls: tls options require an https:\/\/ url/);
+    ).toThrow(/upstreams\.u\.tls: tls options require every target to be an https:\/\/ url/);
     expect(
       parseConfig({
         upstreams: { u: { url: 'https://svc', tls: { caFile: 'ca.pem' } } },

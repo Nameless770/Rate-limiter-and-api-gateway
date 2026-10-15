@@ -1,5 +1,6 @@
+import { readFileSync } from 'node:fs';
 import { Redis } from 'ioredis';
-import type { GatewayConfig } from './config.js';
+import { ConfigError, type GatewayConfig } from './config.js';
 import type { Logger } from './observability/logger.js';
 
 /**
@@ -10,7 +11,18 @@ import type { Logger } from './observability/logger.js';
  * `commandTimeoutMs` or fails immediately, and the limiter's failure mode takes over.
  */
 export function createRedisClient(cfg: NonNullable<GatewayConfig['redis']>, logger: Logger): Redis {
+  let ca: Buffer | undefined;
+  if (cfg.caFile) {
+    try {
+      ca = readFileSync(cfg.caFile);
+    } catch (error) {
+      throw new ConfigError(`redis.caFile: cannot read "${cfg.caFile}": ${(error as Error).message}`);
+    }
+  }
+
   const client = new Redis(cfg.url, {
+    // A rediss:// URL turns TLS on; this only adds a private CA to the trust store used to verify the server.
+    ...(ca ? { tls: { ca } } : {}),
     commandTimeout: cfg.commandTimeoutMs,
     connectTimeout: 2_000,
     enableOfflineQueue: false,

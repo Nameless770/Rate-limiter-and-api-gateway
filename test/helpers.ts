@@ -1,6 +1,6 @@
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import https from 'node:https';
-import type { AddressInfo } from 'node:net';
+import net, { type AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../src/config.js';
 import { Gateway, type GatewayDeps } from '../src/gateway.js';
@@ -223,7 +223,10 @@ export function fakeClock(start = 1_700_000_000_000): TestClock {
 
 export interface RunningGateway {
   gateway: Gateway;
+  /** Proxied traffic. */
   base: string;
+  /** Health and metrics (the separate admin listener). */
+  adminBase: string;
   clock: TestClock;
   /** Backoff delays the retry loop asked for (sleeps are skipped, not performed). */
   delays: number[];
@@ -231,7 +234,14 @@ export interface RunningGateway {
 }
 
 export async function startGateway(raw: Record<string, unknown>, deps: GatewayDeps = {}): Promise<RunningGateway> {
-  const config = parseConfig({ host: '127.0.0.1', port: 0, shutdownGraceMs: 500, ...raw });
+  const adminOverrides = (raw['admin'] ?? {}) as Record<string, unknown>;
+  const config = parseConfig({
+    host: '127.0.0.1',
+    port: 0,
+    shutdownGraceMs: 500,
+    ...raw,
+    admin: { port: 0, ...adminOverrides },
+  });
   const clock = fakeClock();
   const delays: number[] = [];
   const gateway = new Gateway(config, {
@@ -242,5 +252,71 @@ export async function startGateway(raw: Record<string, unknown>, deps: GatewayDe
     ...deps,
   });
   const { port } = await gateway.listen(0, '127.0.0.1');
-  return { gateway, base: `http://127.0.0.1:${port}`, clock, delays, close: () => gateway.close(500) };
+  const adminHost = gateway.adminAddress?.address ?? '127.0.0.1';
+  const adminBase = `http://${adminHost}:${gateway.adminAddress?.port ?? 0}`;
+  return { gateway, base: `http://127.0.0.1:${port}`, adminBase, clock, delays, close: () => gateway.close(500) };
+}
+
+export interface RawTcpResult {
+  /** Everything the server sent, decoded as latin1 so byte values survive. */
+  data: string;
+  /** True if the server closed the connection before `waitMs` elapsed. */
+  closed: boolean;
+  /** How long the connection stayed open, in ms. */
+  openedForMs: number;
+}
+
+/**
+ * Write exact bytes to the gateway's listener and report what comes back. For sending framing no HTTP client
+ * would produce: conflicting lengths, folded headers, a request that is never finished.
+ */
+export function rawTcp(
+  base: string,
+  payload: string | Buffer | Array<string | Buffer>,
+  opts: { waitMs?: number; chunkDelayMs?: number } = {},
+): Promise<RawTcpResult> {
+  const { hostname, port } = new URL(base);
+  const waitMs = opts.waitMs ?? 400;
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const received: Buffer[] = [];
+    let closed = false;
+    const socket = net.connect({ host: hostname, port: Number(port) });
+    const finish = (): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve({ data: Buffer.concat(received).toString('latin1'), closed, openedForMs: Date.now() - started });
+    };
+    const timer = setTimeout(finish, waitMs);
+    socket.on('data', (d: Buffer) => received.push(d));
+    socket.on('close', () => {
+      closed = true;
+      finish();
+    });
+    socket.on('error', (error: NodeJS.ErrnoException) => {
+      // A reset after the server has had its say is a normal way for it to refuse a bad request.
+      if (error.code === 'ECONNRESET' || error.code === 'EPIPE') {
+        closed = true;
+        finish();
+      } else {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    socket.on('connect', () => {
+      void (async () => {
+        const parts = Array.isArray(payload) ? payload : [payload];
+        for (const part of parts) {
+          if (socket.destroyed) return;
+          socket.write(part);
+          if (opts.chunkDelayMs) await sleep(opts.chunkDelayMs);
+        }
+      })();
+    });
+  });
+}
+
+/** The numeric status of every response found in a raw reply, in order. */
+export function statusLines(data: string): number[] {
+  return [...data.matchAll(/HTTP\/1\.[01] (\d{3})/g)].map((m) => Number(m[1]));
 }

@@ -181,7 +181,7 @@ describe('an upstream dying mid-body', () => {
       expect(up.hits).toHaveLength(2);
 
       await sleep(20);
-      const metrics = await (await fetch(`${g.base}/_gateway/metrics`)).text();
+      const metrics = await (await fetch(`${g.adminBase}/_gateway/metrics`)).text();
       expect(metrics).toMatch(/gateway_requests_total\{route="files",status="502"\} 2/); // counted as gateway errors, not 200s
     },
   );
@@ -220,8 +220,10 @@ describe('HTTPS upstreams', () => {
     expect(await errorCode(res)).toBe('bad_gateway');
     expect(up.hits).toHaveLength(0); // the handshake failed, so no request was ever sent
 
-    const metrics = await (await fetch(`${g.base}/_gateway/metrics`)).text();
-    expect(metrics).toMatch(/gateway_upstream_attempts_total\{outcome="tls",upstream="secure"\} 1\n/); // one try, not three
+    const metrics = await (await fetch(`${g.adminBase}/_gateway/metrics`)).text();
+    expect(metrics).toMatch(
+      /gateway_upstream_attempts_total\{outcome="tls",target="127\.0\.0\.1:\d+",upstream="secure"\} 1\n/,
+    ); // one try, not three
   });
 
   it('fail fast at startup when the CA file is missing', () => {

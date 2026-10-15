@@ -3,12 +3,14 @@ import { ConfigError, loadConfig } from './config.js';
 import { Gateway } from './gateway.js';
 import { createLogger, type LogLevel } from './observability/logger.js';
 import { createRedisClient } from './redisClient.js';
+import { securityNotes } from './security.js';
 
 async function main(): Promise<void> {
   const logger = createLogger((process.env['LOG_LEVEL'] as LogLevel | undefined) ?? 'info');
   const configPath = resolve(process.argv[2] ?? process.env['GATEWAY_CONFIG'] ?? 'gateway.config.json');
 
   const config = loadConfig(configPath);
+  for (const note of securityNotes(config)) logger.warn('security', { note });
 
   const redis = config.redis ? createRedisClient(config.redis, logger) : undefined;
   if (redis) {
@@ -22,6 +24,8 @@ async function main(): Promise<void> {
   const address = await gateway.listen();
   logger.info('gateway listening', {
     port: address.port,
+    adminPort: gateway.adminAddress?.port,
+    adminHost: gateway.adminAddress?.address,
     routes: config.routes.length,
     upstreams: Object.keys(config.upstreams),
     redis: redis ? 'enabled' : 'disabled',

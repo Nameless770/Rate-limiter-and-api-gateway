@@ -659,7 +659,7 @@ describe('observability and admin', () => {
   it('reports health with circuit states', async () => {
     const up = await upstream(echo);
     const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
-    const res = await fetch(`${g.base}/_gateway/health`);
+    const res = await fetch(`${g.adminBase}/_gateway/health`);
     const body = (await res.json()) as { status: string; upstreams: { u: { state: string } }; redis: string };
     expect(res.status).toBe(200);
     expect(body.status).toBe('ok');
@@ -684,13 +684,13 @@ describe('observability and admin', () => {
     await fetch(`${g.base}/api/a`, { headers: { 'x-api-key': 'k' } });
     await fetch(`${g.base}/api/a`, { headers: { 'x-api-key': 'k' } }); // 429
 
-    const text = await (await fetch(`${g.base}/_gateway/metrics`)).text();
+    const text = await (await fetch(`${g.adminBase}/_gateway/metrics`)).text();
     expect(text).toContain('# TYPE gateway_requests_total counter');
     expect(text).toMatch(/gateway_requests_total\{route="api",status="200"\} 1/);
     expect(text).toMatch(/gateway_requests_total\{route="api",status="429"\} 1/);
     expect(text).toMatch(/gateway_rate_limited_total\{route="api"\} 1/);
     expect(text).toMatch(/gateway_cache_requests_total\{result="MISS",route="api"\} 1/);
-    expect(text).toMatch(/gateway_circuit_state\{upstream="u"\} 0/);
+    expect(text).toMatch(/gateway_circuit_state\{target="127\.0\.0\.1:\d+",upstream="u"\} 0/);
     expect(text).toContain('gateway_request_duration_seconds_bucket');
   });
 });

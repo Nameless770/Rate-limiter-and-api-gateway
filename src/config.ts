@@ -1,7 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { isLoopbackHost } from './net/ip.js';
 
 const positiveInt = z.number().int().positive();
+const httpUrl = z.url().refine((u) => /^https?:\/\//.test(u), 'must be an http(s) URL');
 
 export const rateLimitRuleSchema = z.discriminatedUnion('algorithm', [
   z.strictObject({
@@ -12,7 +14,14 @@ export const rateLimitRuleSchema = z.discriminatedUnion('algorithm', [
     refillPerSecond: z.number().positive(),
   }),
   z.strictObject({
+    /** Exact: remembers every admitted request. O(limit) memory per key. */
     algorithm: z.literal('sliding-window'),
+    limit: positiveInt,
+    windowMs: positiveInt,
+  }),
+  z.strictObject({
+    /** Approximate: two weighted fixed-window counters. O(1) memory per key, so suited to very high limits. */
+    algorithm: z.literal('sliding-window-counter'),
     limit: positiveInt,
     windowMs: positiveInt,
   }),
@@ -39,7 +48,15 @@ const retrySchema = z.strictObject({
 
 const upstreamSchema = z
   .strictObject({
-    url: z.url().refine((u) => /^https?:\/\//.test(u), 'must be an http(s) URL'),
+    /** A single backend. Use `urls` instead to spread load across several. Exactly one of the two. */
+    url: httpUrl.optional(),
+    /** Several interchangeable backends. Each gets its own circuit breaker, so one bad instance is ejected alone. */
+    urls: z.array(httpUrl).min(1).max(64).optional(),
+    /**
+     * How requests are spread across `urls`. `round-robin` rotates; `least-pending` prefers the target with the
+     * fewest requests in flight, which copes better when some instances are slower than others.
+     */
+    balance: z.enum(['round-robin', 'least-pending']).default('round-robin'),
     /** Per-attempt time to first byte, and idle time afterwards. */
     timeoutMs: positiveInt.default(5_000),
     /**
@@ -62,8 +79,20 @@ const upstreamSchema = z
       .optional(),
   })
   .superRefine((upstream, ctx) => {
-    if (upstream.tls && !upstream.url.startsWith('https://')) {
-      ctx.addIssue({ code: 'custom', path: ['tls'], message: 'tls options require an https:// url' });
+    if ((upstream.url === undefined) === (upstream.urls === undefined)) {
+      ctx.addIssue({ code: 'custom', path: [], message: 'set exactly one of "url" or "urls"' });
+      return;
+    }
+    const targets = upstreamTargets(upstream);
+    if (new Set(targets).size !== targets.length) {
+      ctx.addIssue({ code: 'custom', path: ['urls'], message: 'urls must not contain duplicates' });
+    }
+    if (upstream.tls && !targets.every((t) => t.startsWith('https://'))) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['tls'],
+        message: 'tls options require every target to be an https:// url',
+      });
     }
   });
 
@@ -75,6 +104,13 @@ const routeCacheSchema = z.strictObject({
    * client's response is never served to another. Set to [] only for genuinely public data.
    */
   varyHeaders: z.array(z.string().toLowerCase()).default(['authorization', 'x-api-key']),
+  /**
+   * Request headers forwarded to the upstream on a cacheable request, in addition to `varyHeaders`. Every
+   * header listed here is also part of the cache key, so a client that sends a hostile value can only
+   * poison the entry for requests that carry that same value, never for anyone else. Everything not listed
+   * (X-Forwarded-Host, X-Original-URL, User-Agent, ...) is withheld from cacheable requests.
+   */
+  forwardHeaders: z.array(z.string().toLowerCase()).default(['accept', 'accept-language']),
 });
 
 const routeSchema = z.strictObject({
@@ -91,6 +127,23 @@ const routeSchema = z.strictObject({
   cache: routeCacheSchema.optional(),
 });
 
+const apiKeySchema = z.strictObject({
+  /** For logs and metrics. Never the key itself. */
+  name: z.string().min(1).max(64),
+  /** SHA-256 of the key as 64 hex characters, so the config file holds no secret: `printf %s "$KEY" | sha256sum`. */
+  sha256: z.string().regex(/^[0-9a-fA-F]{64}$/, 'must be a 64-character hex SHA-256 digest'),
+  /** Name of an entry in `plans`; scales every route's rule for this key. */
+  plan: z.string().min(1).optional(),
+  /** Replacement rules by route id for this key. `false` makes the key unlimited on that route. */
+  overrides: z.record(z.string().min(1), z.union([rateLimitRuleSchema, z.literal(false)])).optional(),
+});
+
+/** An empty string means "not set", so `"${ADMIN_TOKEN:-}"` works in a config file. */
+const optionalSecret = z.preprocess(
+  (v) => (v === '' ? undefined : v),
+  z.string().min(16, 'must be at least 16 characters').optional(),
+);
+
 export const configSchema = z
   .strictObject({
     port: z.number().int().min(0).max(65_535).default(8080),
@@ -98,19 +151,39 @@ export const configSchema = z
     maxBodyBytes: positiveInt.default(1_048_576),
     /** How long in-flight requests get to finish on SIGTERM before connections are cut. */
     shutdownGraceMs: positiveInt.default(10_000),
+    /** Methods the gateway will proxy at all. Anything else is answered with 405. */
+    allowedMethods: z
+      .array(z.string().toUpperCase())
+      .min(1)
+      .default(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']),
+    /**
+     * The X-Forwarded-Host sent upstream when the gateway is the edge. It is never derived from the client's
+     * Host header, which an attacker controls and which upstreams commonly use to build absolute links.
+     */
+    forwardedHost: z.string().min(1).optional(),
 
     redis: z
       .strictObject({
+        /** `redis://` or `rediss://` (TLS). A password goes in the URL: rediss://:secret@host:6380. */
         url: z.string().min(1),
         keyPrefix: z.string().default('gw:'),
         /** A slow limiter store must not make every request slow: cap each command. */
         commandTimeoutMs: positiveInt.default(100),
+        /** PEM CA bundle for a Redis server signed by a private CA. Requires a rediss:// url. */
+        caFile: z.string().min(1).optional(),
+      })
+      .superRefine((redis, ctx) => {
+        if (!/^rediss?:\/\//.test(redis.url)) {
+          ctx.addIssue({ code: 'custom', path: ['url'], message: 'must start with redis:// or rediss://' });
+        } else if (redis.caFile && !redis.url.startsWith('rediss://')) {
+          ctx.addIssue({ code: 'custom', path: ['caFile'], message: 'caFile requires a rediss:// url' });
+        }
       })
       .optional(),
 
     rateLimit: z
       .strictObject({
-        /** Header that identifies the caller; falls back to the client IP when absent. */
+        /** Header that carries the caller's API key; clients without a usable key are limited by address. */
         identityHeader: z.string().toLowerCase().default('x-api-key'),
         /**
          * Number of trusted reverse proxies in front of the gateway. 0 uses the socket address. N takes the
@@ -120,6 +193,26 @@ export const configSchema = z
         /** What to do when the limiter store (Redis) is unavailable. */
         failureMode: z.enum(['open', 'closed', 'local']).default('local'),
         default: rateLimitRuleSchema.optional(),
+        /**
+         * A ceiling applied to every request from one client address, across all routes and regardless of the
+         * key presented. It is what stops a client from minting fresh budgets by rotating key values.
+         */
+        ip: rateLimitRuleSchema.optional(),
+        /** IPv6 clients are grouped by this many leading bits (a /64 is one subscriber). */
+        ipv6Prefix: z.number().int().min(32).max(128).default(64),
+        /**
+         * Registered API keys. When this is empty any header value is accepted as an identity (open mode); when
+         * it is set, only these keys get their own budget and everything else shares its address's budget.
+         */
+        apiKeys: z.array(apiKeySchema).default([]),
+        /** Named multipliers a key can reference, e.g. { "pro": { "multiplier": 10 } }. */
+        plans: z
+          .record(z.string().min(1), z.strictObject({ multiplier: z.number().positive().max(1_000) }))
+          .default({}),
+        /** Reject requests without a registered key (401) instead of limiting them by address. */
+        requireKey: z.boolean().default(false),
+        /** Scales the route rule for callers without a registered key, e.g. 0.1 for a tenth of the quota. */
+        anonymousMultiplier: z.number().gt(0).max(1).default(1),
       })
       .prefault({}),
 
@@ -131,11 +224,47 @@ export const configSchema = z
       })
       .prefault({}),
 
+    /**
+     * Health and metrics are served on their own listener so they never share a port with proxied traffic.
+     * The default is loopback-only; binding anywhere else requires a token.
+     */
+    admin: z
+      .strictObject({
+        enabled: z.boolean().default(true),
+        host: z.string().min(1).default('127.0.0.1'),
+        port: z.number().int().min(0).max(65_535).default(9090),
+        /** Bearer token for /_gateway/health and /_gateway/metrics. /_gateway/live is always open. */
+        token: optionalSecret,
+      })
+      .prefault({}),
+
+    limits: z
+      .strictObject({
+        /** Hard cap on open client connections. */
+        maxConnections: positiveInt.default(10_000),
+        /**
+         * Open connections allowed per client address. Unset means 256 when the gateway is the edge and off
+         * when it sits behind trusted proxies (every connection then comes from the proxy). 0 disables.
+         */
+        maxConnectionsPerIp: z.number().int().min(0).optional(),
+        /** Requests being processed at once; beyond this the gateway sheds load with 503. */
+        maxInFlight: positiveInt.default(2_000),
+        /** Total request-body bytes held in memory across all in-flight requests. */
+        maxBufferedBytes: positiveInt.default(64 * 1024 * 1024),
+        maxHeaderBytes: positiveInt.default(16 * 1024),
+        /** Time a client gets to finish sending request headers (slowloris defence). */
+        headersTimeoutMs: positiveInt.default(15_000),
+        /** Time a client gets to finish sending a whole request. */
+        requestTimeoutMs: positiveInt.default(60_000),
+        keepAliveTimeoutMs: positiveInt.default(65_000),
+      })
+      .prefault({}),
+
     upstreams: z.record(z.string().min(1), upstreamSchema),
     routes: z.array(routeSchema).min(1),
   })
   .superRefine((cfg, ctx) => {
-    const seen = new Set<string>();
+    const seenRoutes = new Set<string>();
     cfg.routes.forEach((route, i) => {
       if (!(route.upstream in cfg.upstreams)) {
         ctx.addIssue({
@@ -145,10 +274,10 @@ export const configSchema = z
         });
       }
       const id = route.id ?? route.path;
-      if (seen.has(id)) {
+      if (seenRoutes.has(id)) {
         ctx.addIssue({ code: 'custom', path: ['routes', i, 'id'], message: `duplicate route id "${id}"` });
       }
-      seen.add(id);
+      seenRoutes.add(id);
       if (route.path.startsWith('/_gateway')) {
         ctx.addIssue({
           code: 'custom',
@@ -157,12 +286,72 @@ export const configSchema = z
         });
       }
     });
+
+    const rl = cfg.rateLimit;
+    const names = new Set<string>();
+    const digests = new Set<string>();
+    rl.apiKeys.forEach((key, i) => {
+      if (names.has(key.name)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['rateLimit', 'apiKeys', i, 'name'],
+          message: `duplicate key name "${key.name}"`,
+        });
+      }
+      names.add(key.name);
+      const digest = key.sha256.toLowerCase();
+      if (digests.has(digest)) {
+        ctx.addIssue({ code: 'custom', path: ['rateLimit', 'apiKeys', i, 'sha256'], message: 'duplicate key digest' });
+      }
+      digests.add(digest);
+      if (key.plan !== undefined && !(key.plan in rl.plans)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['rateLimit', 'apiKeys', i, 'plan'],
+          message: `unknown plan "${key.plan}" (defined: ${Object.keys(rl.plans).join(', ') || 'none'})`,
+        });
+      }
+      for (const routeId of Object.keys(key.overrides ?? {})) {
+        if (!seenRoutes.has(routeId)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['rateLimit', 'apiKeys', i, 'overrides', routeId],
+            message: `unknown route id "${routeId}"`,
+          });
+        }
+      }
+    });
+    if (rl.requireKey && rl.apiKeys.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['rateLimit', 'requireKey'],
+        message: 'requireKey needs at least one entry in apiKeys',
+      });
+    }
+
+    if (cfg.admin.enabled) {
+      if (!isLoopbackHost(cfg.admin.host) && cfg.admin.token === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['admin', 'token'],
+          message: `admin.host "${cfg.admin.host}" is reachable beyond this machine, so admin.token (16+ characters) is required`,
+        });
+      }
+      if (cfg.admin.port !== 0 && cfg.admin.port === cfg.port) {
+        ctx.addIssue({ code: 'custom', path: ['admin', 'port'], message: 'admin.port must differ from port' });
+      }
+    }
   });
 
 export type GatewayConfig = z.infer<typeof configSchema>;
 export type RouteConfig = GatewayConfig['routes'][number];
 export type UpstreamConfig = GatewayConfig['upstreams'][string];
 export type RateLimitRuleConfig = z.infer<typeof rateLimitRuleSchema>;
+
+/** The URLs of an upstream's targets, whether it was written with `url` or `urls`. */
+export function upstreamTargets(upstream: { url?: string | undefined; urls?: string[] | undefined }): string[] {
+  return upstream.urls ?? (upstream.url ? [upstream.url] : []);
+}
 
 export class ConfigError extends Error {
   constructor(message: string) {
