@@ -48,6 +48,12 @@ export interface UpstreamClientOptions {
    * this upstream only, so the upstream must chain to one of these certificates.
    */
   ca?: string | Buffer;
+  /**
+   * Most connections held open to this target. Requests beyond it wait for one to free up. Idle connections
+   * are kept up to the same number: a lower "free" cap makes every burst above it destroy and re-open sockets,
+   * which burns CPU on handshakes and exhausts ephemeral ports (TIME_WAIT) under sustained load.
+   */
+  maxConnections?: number;
 }
 
 const CONNECT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
@@ -62,7 +68,8 @@ export class UpstreamClient {
   constructor(baseUrl: string, options: UpstreamClientOptions) {
     this.target = new URL(baseUrl);
     this.timeoutMs = options.timeoutMs;
-    const agentOptions = { keepAlive: true, maxSockets: 256, maxFreeSockets: 32 };
+    const max = options.maxConnections ?? 256;
+    const agentOptions = { keepAlive: true, maxSockets: max, maxFreeSockets: max };
     this.agent =
       this.target.protocol === 'https:'
         ? new https.Agent({ ...agentOptions, ...(options.ca ? { ca: options.ca } : {}) })

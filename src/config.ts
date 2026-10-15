@@ -60,6 +60,12 @@ const upstreamSchema = z
     /** Per-attempt time to first byte, and idle time afterwards. */
     timeoutMs: positiveInt.default(5_000),
     /**
+     * Most connections the gateway holds open to each target. It is also how you cap the load one gateway
+     * instance can put on a backend: requests beyond it queue for a free connection (and count against
+     * `timeoutMs`).
+     */
+    maxConnections: positiveInt.default(256),
+    /**
      * Overall deadline across all attempts and backoff sleeps. Without it a request can take
      * maxAttempts x timeoutMs, which is usually longer than the client will wait and multiplies the load
      * on an upstream that is already struggling. Unset means attempts are only bounded individually.

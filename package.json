@@ -20,7 +20,10 @@
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run lint && npm test",
     "demo:upstream": "node demo/flaky-upstream.mjs",
-    "demo:hammer": "node demo/hammer.mjs"
+    "demo:hammer": "node demo/hammer.mjs",
+    "bench": "npm run build && node bench/run.mjs",
+    "bench:soak": "npm run build && node bench/soak.mjs",
+    "bench:profile": "npm run build && node bench/profile.mjs"
   },
   "dependencies": {
     "ioredis": "^6.0.0",

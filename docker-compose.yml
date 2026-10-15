@@ -1,11 +1,14 @@
 # Two gateway instances behind different ports, sharing one Redis. Send requests with the same X-API-Key to
 # :8080 and :8081 and they draw from a single rate-limit budget: that is the distributed part.
 # Host ports can be moved if they're taken: GATEWAY_A_PORT=18080 GATEWAY_B_PORT=18081 docker compose up
+#
+# The admin listener (health, metrics) binds to loopback *inside* each container and is not published. To read it:
+#   docker compose exec gateway-a wget -qO- http://127.0.0.1:9090/_gateway/metrics
 name: api-gateway
 
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     # Rate-limit state is disposable, so skip persistence entirely.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
@@ -15,19 +18,23 @@ services:
       retries: 10
 
   upstream:
-    build: .
-    command: ["node", "demo/flaky-upstream.mjs"]
+    build:
+      context: .
+      target: demo-upstream
     environment:
       PORT: "9001"
     ports:
-      - "${UPSTREAM_PORT:-9001}:9001" # exposed so you can flip /_demo/failure?rate=1 from the host
-    healthcheck: # the image's own healthcheck probes the gateway port, which this service doesn't use
+      # Exposed so you can flip /_demo/failure?rate=1 from the host. It's a demo service: don't publish it elsewhere.
+      - "127.0.0.1:${UPSTREAM_PORT:-9001}:9001"
+    healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9001/health"]
       interval: 10s
       timeout: 3s
 
   gateway-a: &gateway
-    build: .
+    build:
+      context: .
+      target: runtime
     ports:
       - "${GATEWAY_A_PORT:-8080}:8080"
     environment:

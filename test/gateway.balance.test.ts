@@ -231,3 +231,49 @@ describe('visibility', () => {
     expect(health.upstreams.pool.state).toBe('open');
   });
 });
+
+describe('upstream connection reuse', () => {
+  it('keeps idle connections for reuse under concurrent load instead of closing and reopening them', async () => {
+    // 60 concurrent requests need about 60 connections. Every later wave must reuse them: a free-socket cap
+    // below the concurrency level makes each wave destroy and re-open the surplus, which at load exhausts
+    // ephemeral ports (TIME_WAIT) and wastes CPU on handshakes.
+    const up = await upstream(async (_r, res) => {
+      await sleep(25);
+      json(res, 200, { ok: true });
+    });
+    const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] });
+    const wave = () => Promise.all(Array.from({ length: 60 }, () => get(g)));
+
+    await wave();
+    const afterFirst = up.connections();
+    expect(afterFirst).toBeLessThanOrEqual(62);
+
+    for (let i = 0; i < 4; i++) {
+      const statuses = (await wave()).map((r) => r.status);
+      expect(statuses.every((s) => s === 200)).toBe(true);
+    }
+    expect(up.connections() - afterFirst).toBeLessThanOrEqual(4); // not ~28 per wave
+  });
+
+  it('caps connections per target and queues the excess rather than refusing it', async () => {
+    let concurrent = 0;
+    let peak = 0;
+    const up = await upstream(async (_r, res) => {
+      concurrent++;
+      peak = Math.max(peak, concurrent);
+      await sleep(40);
+      concurrent--;
+      json(res, 200, { ok: true });
+    });
+    const g = await gateway({
+      upstreams: { u: { url: up.url, maxConnections: 3 } },
+      routes: [{ path: '/', upstream: 'u' }],
+    });
+    const results = await Promise.all(Array.from({ length: 12 }, () => get(g)));
+
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(up.hits).toHaveLength(12);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(up.connections()).toBeLessThanOrEqual(3);
+  });
+});

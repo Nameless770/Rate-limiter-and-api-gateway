@@ -248,7 +248,11 @@ export class Gateway {
         return {
           id,
           pending: 0,
-          client: new UpstreamClient(url, { timeoutMs: upstreamConfig.timeoutMs, ca }),
+          client: new UpstreamClient(url, {
+            timeoutMs: upstreamConfig.timeoutMs,
+            maxConnections: upstreamConfig.maxConnections,
+            ca,
+          }),
           breaker: new CircuitBreaker({
             ...upstreamConfig.breaker,
             clock: this.clock,

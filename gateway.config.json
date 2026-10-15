@@ -1,10 +1,17 @@
 {
   "port": 8080,
 
+  "admin": {
+    "host": "${ADMIN_HOST:-127.0.0.1}",
+    "port": 9090,
+    "token": "${ADMIN_TOKEN:-}"
+  },
+
   "rateLimit": {
     "identityHeader": "x-api-key",
     "failureMode": "local",
-    "default": { "algorithm": "sliding-window", "limit": 60, "windowMs": 60000 }
+    "default": { "algorithm": "sliding-window", "limit": 60, "windowMs": 60000 },
+    "ip": { "algorithm": "sliding-window-counter", "limit": 600, "windowMs": 60000 }
   },
 
   "cache": { "maxEntries": 1000, "maxBytes": 52428800, "maxEntryBytes": 1048576 },

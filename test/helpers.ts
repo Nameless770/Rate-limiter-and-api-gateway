@@ -20,6 +20,8 @@ export interface FakeUpstream {
   url: string;
   port: number;
   hits: Hit[];
+  /** TCP connections accepted so far. */
+  connections(): number;
   close(): Promise<void>;
 }
 
@@ -55,12 +57,17 @@ export async function startUpstream(handler: UpstreamHandler, options: UpstreamO
     }
   };
   const server = options.tls ? https.createServer(options.tls, listener) : http.createServer(listener);
+  let connections = 0;
+  server.on('connection', () => {
+    connections++;
+  });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;
   return {
     url: `${options.tls ? 'https' : 'http'}://127.0.0.1:${port}`,
     port,
     hits,
+    connections: () => connections,
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();
