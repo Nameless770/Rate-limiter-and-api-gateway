@@ -70,7 +70,7 @@ export async function startBenchGateway(config, { logLevel = 'warn', logToFile }
   const dir = mkdtempSync(join(tmpdir(), 'gw-bench-'));
   const configPath = join(dir, 'gateway.json');
   writeFileSync(configPath, JSON.stringify(config));
-  const child = spawn(process.execPath, [join(projectRoot, 'dist', 'index.js'), configPath], {
+  const child = spawn(process.execPath, [join(projectRoot, process.env.GATEWAY_DIST ?? 'dist', 'index.js'), configPath], {
     cwd: projectRoot,
     env: { ...process.env, LOG_LEVEL: logLevel, PORT: undefined, REDIS_URL: undefined },
     stdio: ['ignore', logToFile ? 'ignore' : 'ignore', 'pipe'],

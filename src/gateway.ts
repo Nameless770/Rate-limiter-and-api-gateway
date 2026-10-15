@@ -130,6 +130,9 @@ class ClientAbortedError extends Error {
   }
 }
 
+/** Longest request path written to an access-log line. */
+const MAX_LOGGED_PATH = 512;
+
 const IDEMPOTENT = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE']);
 /** An attempt with less budget than this left is not worth starting. */
 const MIN_ATTEMPT_BUDGET_MS = 10;
@@ -1221,7 +1224,8 @@ export class Gateway {
     this.logger.info('request', {
       requestId: ctx.requestId,
       method: ctx.method,
-      path: ctx.path,
+      // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
+      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path,
       route: ctx.route,
       status,
       durationMs: Math.round(durationMs * 10) / 10,

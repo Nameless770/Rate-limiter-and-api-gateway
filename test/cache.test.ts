@@ -163,3 +163,33 @@ describe('ResponseCache', () => {
     expect(next.coalesced).toBe(false);
   });
 });
+
+describe('ResponseCache byte accounting', () => {
+  const entry = (body: string): CachedResponse => ({
+    status: 200,
+    headers: {},
+    body: Buffer.from(body),
+    storedAt: 0,
+    expiresAt: 10_000,
+    vary: {},
+  });
+
+  it('charges the key against the budget, so long client-chosen URLs cannot inflate the cache', () => {
+    const cache = new ResponseCache({ maxEntries: 1_000_000, maxBytes: 100_000, maxEntryBytes: 1000, clock: () => 0 });
+    const longKey = (i: number) => `u\u0000/${'a'.repeat(8000)}${i}`;
+    for (let i = 0; i < 50; i++) cache.set(longKey(i), entry('x')); // a one-byte body behind a 16 KB key
+
+    expect(cache.stats().bytes).toBeLessThanOrEqual(100_000);
+    expect(cache.stats().entries).toBeLessThan(10); // about 6 fit; the rest were evicted
+    expect(cache.stats().evictions).toBeGreaterThan(40);
+  });
+
+  it('releases exactly what it charged', () => {
+    const cache = new ResponseCache({ maxEntries: 10, maxBytes: 100_000, maxEntryBytes: 1000, clock: () => 0 });
+    cache.set('a'.repeat(500), entry('body'));
+    cache.set('b'.repeat(300), entry('body'));
+    cache.delete('a'.repeat(500));
+    cache.delete('b'.repeat(300));
+    expect(cache.stats().bytes).toBe(0);
+  });
+});

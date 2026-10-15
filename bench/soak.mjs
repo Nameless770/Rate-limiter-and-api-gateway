@@ -133,7 +133,7 @@ function slope(field, from) {
 const nearest = (t) => samples.reduce((best, s) => (Math.abs(s.t - t) < Math.abs(best.t - t) ? s : best));
 const peak = (field) => Math.max(...samples.map((s) => s[field]));
 const last = samples[samples.length - 1];
-const settle = Math.min(90, seconds / 3);
+const settle = seconds / 2; // judge the trend on the second half, after warm-up
 const settled = nearest(settle);
 
 const total = results.reduce((a, r) => a + r.requests, 0);

@@ -34,6 +34,15 @@ export interface CacheStats {
 
 const ENTRY_OVERHEAD_BYTES = 256; // rough per-entry bookkeeping so tiny bodies still count against the budget
 
+/**
+ * What an entry costs against the byte budget. The key counts: it is built from the request path and query, which
+ * the client controls (up to the header size limit), so charging only the body would let long URLs with tiny
+ * responses grow the cache well past its budget. Two bytes per character covers V8's UTF-16 worst case.
+ */
+function entrySize(key: string, entry: CachedResponse): number {
+  return entry.body.length + key.length * 2 + ENTRY_OVERHEAD_BYTES;
+}
+
 export class ResponseCache {
   private readonly entries = new Map<string, CachedResponse>(); // insertion order == recency order
   private readonly inflight = new Map<string, Promise<unknown>>();
@@ -80,7 +89,7 @@ export class ResponseCache {
   }
 
   set(key: string, entry: CachedResponse): boolean {
-    const size = entry.body.length + ENTRY_OVERHEAD_BYTES;
+    const size = entrySize(key, entry);
     if (entry.body.length > this.opts.maxEntryBytes || size > this.opts.maxBytes) return false;
 
     const existing = this.entries.get(key);
@@ -141,6 +150,6 @@ export class ResponseCache {
 
   private remove(key: string, entry: CachedResponse): void {
     this.entries.delete(key);
-    this.bytes -= entry.body.length + ENTRY_OVERHEAD_BYTES;
+    this.bytes -= entrySize(key, entry);
   }
 }

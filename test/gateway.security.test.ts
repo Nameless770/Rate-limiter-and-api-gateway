@@ -662,3 +662,21 @@ describe('resource limits', () => {
 
 // A reference so the unused-import guard stays honest if a helper is dropped from a future edit.
 void http;
+
+describe('access logs', () => {
+  it('bound the request path, so a long URL cannot amplify into a long log line', async () => {
+    const up = await upstream(echo);
+    const lines: Array<Record<string, unknown>> = [];
+    const { createLogger } = await import('../src/observability/logger.js');
+    const logger = createLogger('info', (l) => void lines.push(JSON.parse(l)));
+    const g = await gateway({ upstreams: { u: { url: up.url } }, routes: [{ path: '/', upstream: 'u' }] }, { logger });
+
+    await get(g, `/${'p'.repeat(6000)}`);
+    await sleep(20);
+    const entry = lines.find((l) => l['msg'] === 'request');
+    const logged = String(entry?.['path']);
+    expect(logged.length).toBeLessThanOrEqual(513);
+    expect(logged.endsWith('…')).toBe(true);
+    expect(JSON.stringify(entry).length).toBeLessThan(1500);
+  });
+});

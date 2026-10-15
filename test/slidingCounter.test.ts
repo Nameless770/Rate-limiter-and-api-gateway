@@ -151,7 +151,9 @@ describe('in-memory sliding window counter', () => {
     expect((await limiter.consume('b')).allowed).toBe(true);
     await limiter.consume('c');
     now += 5000;
-    await limiter.consume('d'); // at capacity: sweeps the aged-out keys instead of evicting a live one
+    await limiter.consume('d'); // at capacity: evicts the least recently used key in O(1)
+    expect(limiter.size).toBe(3);
+    expect(limiter.sweep()).toBe(2); // 'a' was the one evicted; the sweep drops the other two aged-out keys
     expect(limiter.size).toBe(1);
     limiter.close();
   });

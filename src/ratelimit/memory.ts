@@ -80,7 +80,11 @@ class MemoryRateLimiter<S> implements RateLimiter {
     this.states.clear();
   }
 
-  private sweep(): number {
+  /**
+   * Drop every key whose state is indistinguishable from a fresh one. O(number of keys), so it runs on a timer
+   * (and is exposed for tests), never on the request path.
+   */
+  sweep(): number {
     const now = this.clock();
     let removed = 0;
     for (const [key, state] of this.states) {
@@ -92,8 +96,15 @@ class MemoryRateLimiter<S> implements RateLimiter {
     return removed;
   }
 
+  /**
+   * Make room for one new key in O(1). consume() re-inserts a key on every use, so the Map iterates least
+   * recently used first: the head is an expired entry if there is one, and otherwise the client that has been
+   * quiet the longest.
+   *
+   * This must never scan the table. Identities are attacker-controlled, so a client sending a fresh key per
+   * request keeps the table permanently full, and a scan per insert would let it burn O(maxKeys) CPU per request.
+   */
   private makeRoom(): void {
-    if (this.sweep() > 0 && this.states.size < this.maxKeys) return;
     const oldest = this.states.keys().next();
     if (!oldest.done) this.states.delete(oldest.value);
   }

@@ -151,18 +151,58 @@ describe('in-memory limiters', () => {
     limiter.close();
   });
 
-  it('sweeps keys whose state is indistinguishable from a fresh one', async () => {
+  it('reclaims keys whose state is indistinguishable from a fresh one when swept', async () => {
     let now = 0;
     const limiter = memoryTokenBucket(
       { capacity: 2, refillPerSecond: 1 },
-      { clock: () => now, maxKeys: 3, sweepIntervalMs: 0 },
+      { clock: () => now, maxKeys: 10, sweepIntervalMs: 0 },
     );
     await limiter.consume('a');
     await limiter.consume('b');
     await limiter.consume('c');
     now += 60_000; // all three have long since refilled
-    await limiter.consume('d'); // at capacity: triggers a sweep rather than evicting a live client
+    await limiter.consume('fresh'); // 'fresh' is the only one that is not full again
+    expect(limiter.sweep()).toBe(3);
     expect(limiter.size).toBe(1);
+    limiter.close();
+  });
+
+  it('evicts the least recently used key when full, never a recently used one', async () => {
+    let now = 0;
+    const limiter = memoryTokenBucket(
+      { capacity: 1, refillPerSecond: 0.001 }, // a spent bucket stays spent for the whole test
+      { clock: () => now, maxKeys: 3, sweepIntervalMs: 0 },
+    );
+    for (const k of ['a', 'b', 'c']) expect((await limiter.consume(k)).allowed).toBe(true);
+    now += 1;
+    await limiter.consume('a'); // denied, but it is now the most recently used
+    await limiter.consume('d'); // full: must evict 'b', the least recently used
+    expect(limiter.size).toBe(3);
+    expect((await limiter.consume('a')).allowed).toBe(false); // 'a' kept its spent bucket
+    expect((await limiter.consume('c')).allowed).toBe(false); // so did 'c'
+    expect((await limiter.consume('b')).allowed).toBe(true); // 'b' was evicted, so it starts fresh
+    limiter.close();
+  });
+
+  it('takes constant time per new key once full, so unique-key floods cannot starve the event loop', async () => {
+    // A full table must not be scanned on every insert: with N keys that is O(N) per request, and an attacker
+    // supplying fresh keys keeps the table full. 40,000 inserts into a 40,000-key table would then perform
+    // about 1.6 billion entry checks.
+    const maxKeys = 40_000;
+    // A frozen clock means nothing ever expires: the worst case, and exactly what a flood of fresh keys looks like.
+    const limiter = memoryTokenBucket(
+      { capacity: 5, refillPerSecond: 1 },
+      { maxKeys, sweepIntervalMs: 0, clock: () => 0 },
+    );
+    for (let i = 0; i < maxKeys; i++) await limiter.consume(`warm-${i}`);
+    expect(limiter.size).toBe(maxKeys);
+
+    const started = performance.now();
+    for (let i = 0; i < maxKeys; i++) await limiter.consume(`flood-${i}`);
+    const elapsedMs = performance.now() - started;
+
+    expect(limiter.size).toBe(maxKeys);
+    expect(elapsedMs).toBeLessThan(3_000); // measured in tens of milliseconds; the quadratic version takes minutes
     limiter.close();
   });
 });
