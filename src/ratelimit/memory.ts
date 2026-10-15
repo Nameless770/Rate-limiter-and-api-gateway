@@ -4,12 +4,15 @@
  */
 import {
   type SlidingWindowParams,
+  slidingWindowCounterIsExpired,
+  slidingWindowCounterStep,
   slidingWindowIsExpired,
   slidingWindowStep,
   type TokenBucketParams,
   type TokenBucketState,
   tokenBucketIsExpired,
   tokenBucketStep,
+  type WindowCounterState,
 } from './algorithms.js';
 import type { Clock, RateLimitDecision, RateLimiter } from './types.js';
 
@@ -124,6 +127,21 @@ export function memorySlidingWindow(
         return { state: timestamps, decision };
       },
       isExpired: (state, now) => slidingWindowIsExpired(state, now, params),
+    },
+    options,
+  );
+}
+
+export function memorySlidingWindowCounter(
+  params: SlidingWindowParams,
+  options?: MemoryLimiterOptions,
+): MemoryRateLimiter<WindowCounterState> {
+  return new MemoryRateLimiter<WindowCounterState>(
+    {
+      limit: params.limit,
+      maxCost: params.limit,
+      step: (state, now, cost) => slidingWindowCounterStep(state, now, params, cost),
+      isExpired: (state, now) => slidingWindowCounterIsExpired(state, now, params),
     },
     options,
   );

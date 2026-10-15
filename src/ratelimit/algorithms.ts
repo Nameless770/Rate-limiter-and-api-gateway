@@ -136,3 +136,101 @@ export function slidingWindowIsExpired(timestamps: number[], now: number, params
   const newest = timestamps[timestamps.length - 1];
   return newest === undefined || newest + params.windowMs <= now;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sliding window counter (approximate)
+//
+// Keeps one counter for the current fixed window and one for the previous, and estimates the trailing-window
+// count as `previous * (share of the previous window still inside the trailing window) + current`. It assumes
+// the previous window's requests were spread evenly, which makes it an approximation: it can briefly admit a
+// little more or less than an exact log would, but it uses O(1) memory per key however large `limit` is, where
+// the log needs one entry per admitted request.
+//
+// All arithmetic is scaled by `windowMs` and kept in integers, so the Redis Lua script can reproduce every
+// decision exactly instead of agreeing only up to floating-point drift.
+// ---------------------------------------------------------------------------------------------------------------------
+
+export interface WindowCounterState {
+  /** Index of the fixed window `current` belongs to: floor(timestamp / windowMs). */
+  window: number;
+  current: number;
+  previous: number;
+}
+
+export function slidingWindowCounterStep(
+  state: WindowCounterState | undefined,
+  now: number,
+  params: SlidingWindowParams,
+  cost: number,
+): { state: WindowCounterState; decision: RateLimitDecision } {
+  const { limit, windowMs } = params;
+
+  // A clock stepping backwards must not move us into a window earlier than the one we have state for.
+  const at = state ? Math.max(now, state.window * windowMs) : now;
+  const window = Math.floor(at / windowMs);
+  const elapsed = at - window * windowMs;
+
+  let current = 0;
+  let previous = 0;
+  if (state) {
+    if (state.window === window) {
+      current = state.current;
+      previous = state.previous;
+    } else if (state.window === window - 1) {
+      previous = state.current;
+    } // older than that: both windows have aged out completely
+  }
+
+  const capacity = limit * windowMs;
+  let used = previous * (windowMs - elapsed) + current * windowMs; // estimated count, scaled by windowMs
+
+  if (used + cost * windowMs <= capacity) {
+    current += cost;
+    used += cost * windowMs;
+    return {
+      state: { window, current, previous },
+      decision: {
+        allowed: true,
+        limit,
+        remaining: Math.max(0, Math.floor((capacity - used) / windowMs)),
+        retryAfterMs: 0,
+        resetAfterMs: windowMs - elapsed + windowMs, // `current` decays to nothing by the end of the next window
+      },
+    };
+  }
+
+  // Denied: find the first instant the estimate drops far enough to fit `cost`.
+  const headroom = limit - current - cost;
+  let retryAfterMs: number;
+  if (headroom >= 0 && previous > 0) {
+    // Same window: previous * (windowMs - e) <= headroom * windowMs, so e >= windowMs - floor(headroom*windowMs/previous).
+    const needed = windowMs - Math.floor((headroom * windowMs) / previous);
+    retryAfterMs = Math.max(1, needed - elapsed);
+  } else {
+    // `current` alone fills the window, so wait for it to roll over and decay as `previous`.
+    const spare = limit - cost; // >= 0 because cost <= limit; current > 0 here
+    const needed = Math.max(0, windowMs - Math.floor((spare * windowMs) / current));
+    retryAfterMs = windowMs - elapsed + needed;
+  }
+
+  return {
+    // Denials never write, in either implementation, so the stored state is left exactly as it was.
+    state: state ?? { window, current, previous },
+    decision: {
+      allowed: false,
+      limit,
+      remaining: 0,
+      retryAfterMs,
+      resetAfterMs: current > 0 ? windowMs - elapsed + windowMs : windowMs - elapsed,
+    },
+  };
+}
+
+/** Once both windows have aged out the state is indistinguishable from none and can be dropped. */
+export function slidingWindowCounterIsExpired(
+  state: WindowCounterState,
+  now: number,
+  params: SlidingWindowParams,
+): boolean {
+  return state.window < Math.floor(now / params.windowMs) - 1;
+}

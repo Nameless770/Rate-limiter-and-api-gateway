@@ -26,11 +26,19 @@ export interface RateLimiter {
 
 export type RateLimitRule =
   | { algorithm: 'token-bucket'; capacity: number; refillPerSecond: number }
-  | { algorithm: 'sliding-window'; limit: number; windowMs: number };
+  | { algorithm: 'sliding-window'; limit: number; windowMs: number }
+  | { algorithm: 'sliding-window-counter'; limit: number; windowMs: number };
 
 /** Stable identifier for the algorithm, used to namespace keys so two algorithms never share a Redis key. */
-export function algorithmTag(rule: RateLimitRule): 'tb' | 'sw' {
-  return rule.algorithm === 'token-bucket' ? 'tb' : 'sw';
+export function algorithmTag(rule: RateLimitRule): 'tb' | 'sw' | 'sc' {
+  switch (rule.algorithm) {
+    case 'token-bucket':
+      return 'tb';
+    case 'sliding-window':
+      return 'sw';
+    case 'sliding-window-counter':
+      return 'sc';
+  }
 }
 
 /** Raised when the limiter's backing store is down and the configured failure mode is "closed". */

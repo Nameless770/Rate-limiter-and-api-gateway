@@ -105,11 +105,78 @@ local reset_after = tonumber(newest[2]) + window - now
 return {0, 0, retry_after, reset_after}
 `;
 
+/**
+ * Approximate sliding window: two fixed-window counters weighted by how much of the previous window is still
+ * inside the trailing window. O(1) per key. Integer arithmetic scaled by the window, matching
+ * slidingWindowCounterStep() in algorithms.ts exactly.
+ *
+ * KEYS[1] hash with fields w (window index), c (current count), p (previous count)
+ * ARGV    limit, window ms, cost, now (ms; 0 = ask Redis)
+ * returns {allowed, remaining, retryAfterMs, resetAfterMs}
+ */
+export const SLIDING_COUNTER_LUA = `
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+${NOW_FROM_REDIS}
+
+local st = redis.call('HMGET', key, 'w', 'c', 'p')
+local w = tonumber(st[1])
+local c = tonumber(st[2])
+local p = tonumber(st[3])
+
+-- A clock stepping backwards must not move us into a window earlier than the one we have state for.
+if w ~= nil and now < w * window then now = w * window end
+local widx = math.floor(now / window)
+local elapsed = now - widx * window
+
+local current = 0
+local previous = 0
+if w ~= nil then
+  if w == widx then
+    current = c
+    previous = p
+  elseif w == widx - 1 then
+    previous = c
+  end
+end
+
+local capacity = limit * window
+local used = previous * (window - elapsed) + current * window
+
+if used + cost * window <= capacity then
+  current = current + cost
+  used = used + cost * window
+  redis.call('HSET', key, 'w', tostring(widx), 'c', tostring(current), 'p', tostring(previous))
+  -- Two windows later the state is indistinguishable from none.
+  redis.call('PEXPIRE', key, window * 2)
+  local remaining = math.max(0, math.floor((capacity - used) / window))
+  return {1, remaining, 0, window - elapsed + window}
+end
+
+local headroom = limit - current - cost
+local retry_after
+if headroom >= 0 and previous > 0 then
+  local needed = window - math.floor((headroom * window) / previous)
+  retry_after = math.max(1, needed - elapsed)
+else
+  local spare = limit - cost
+  local needed = math.max(0, window - math.floor((spare * window) / current))
+  retry_after = window - elapsed + needed
+end
+local reset_after = window - elapsed
+if current > 0 then reset_after = window - elapsed + window end
+return {0, 0, retry_after, reset_after}
+`;
+
 type ScriptResult = [allowed: number, remaining: number, retryAfterMs: number, resetAfterMs: number];
 
 interface ScriptCommands {
   gwTokenBucket(key: string, ...args: (string | number)[]): Promise<ScriptResult>;
   gwSlidingWindow(key: string, ...args: (string | number)[]): Promise<ScriptResult>;
+  gwSlidingCounter(key: string, ...args: (string | number)[]): Promise<ScriptResult>;
 }
 
 type ScriptedRedis = Redis & ScriptCommands;
@@ -118,6 +185,7 @@ function withScripts(redis: Redis): ScriptedRedis {
   // defineCommand is idempotent per connection; ioredis uses EVALSHA and falls back to EVAL on NOSCRIPT.
   redis.defineCommand('gwTokenBucket', { numberOfKeys: 1, lua: TOKEN_BUCKET_LUA });
   redis.defineCommand('gwSlidingWindow', { numberOfKeys: 1, lua: SLIDING_WINDOW_LUA });
+  redis.defineCommand('gwSlidingCounter', { numberOfKeys: 1, lua: SLIDING_COUNTER_LUA });
   return redis as ScriptedRedis;
 }
 
@@ -203,6 +271,34 @@ export class RedisSlidingWindow implements RateLimiter {
       cost,
       this.clock ? this.clock() : 0,
       member,
+    );
+    return toDecision(this.params.limit, result);
+  }
+}
+
+export class RedisSlidingWindowCounter implements RateLimiter {
+  private readonly redis: ScriptedRedis;
+  private readonly prefix: string;
+  private readonly clock?: Clock;
+
+  constructor(
+    redis: Redis,
+    private readonly params: SlidingWindowParams,
+    options: RedisLimiterOptions = {},
+  ) {
+    this.redis = withScripts(redis);
+    this.prefix = options.keyPrefix ?? '';
+    this.clock = options.clock;
+  }
+
+  async consume(key: string, cost = 1): Promise<RateLimitDecision> {
+    assertCost(cost, this.params.limit);
+    const result = await this.redis.gwSlidingCounter(
+      this.prefix + key,
+      this.params.limit,
+      this.params.windowMs,
+      cost,
+      this.clock ? this.clock() : 0,
     );
     return toDecision(this.params.limit, result);
   }
