@@ -1,0 +1,4 @@
+# Keep LF in the repo and in checkouts on every OS, so the formatter and CI agree.
+* text=auto eol=lf
+*.pem text eol=lf
+*.png binary
