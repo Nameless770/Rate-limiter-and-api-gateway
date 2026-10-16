@@ -9,6 +9,7 @@ A small API gateway that sits in front of other HTTP services and handles the cr
 - **Load balancing** across several targets per upstream, each with its own circuit breaker
 - **Retries** with exponential backoff and full jitter
 - **Circuit breaking** per target, so a failing instance gets room to recover and callers fail fast
+- **Active health checks**, so traffic avoids a down target before any client request has to fail to find out
 
 Written in TypeScript on Node's built-in `http`. The only runtime dependencies are `ioredis` (the Redis client) and `zod` (config validation). The rate limiters, circuit breaker, retry loop, balancer and cache are hand-written.
 
@@ -161,6 +162,21 @@ Many frameworks build absolute links or error pages from headers like `X-Forward
 
 `round-robin` rotates; `least-pending` prefers the target with the fewest requests awaiting response headers, which copes better when instances differ in speed. A retry goes to a **different** target when one is available, even if other traffic has rotated the cursor back onto the one that just failed.
 
+**Health checks.** The breaker is *passive*: it learns a target is bad only by sending it real requests that fail, so some clients always pay for the discovery. A health check is *active*:
+
+```json
+"users": {
+  "urls": ["http://10.0.0.5:8080", "http://10.0.0.6:8080"],
+  "healthCheck": { "path": "/healthz", "intervalMs": 5000, "timeoutMs": 2000, "unhealthyThreshold": 2, "healthyThreshold": 2 }
+}
+```
+
+- Each target is probed on its own schedule (±10% jitter, so a fleet of gateways doesn't probe in lockstep), over a **dedicated connection** that doesn't queue behind proxied traffic.
+- `unhealthyThreshold` consecutive failures take a target out of rotation; `healthyThreshold` consecutive successes put it back. A failure (timeout, refused, TLS error, unexpected status) in the middle of a recovery resets the count.
+- **If every target is unhealthy, the verdict is ignored** and the breakers alone decide ("panic mode"): a wrong health path or a flapping probe must not be able to take a service offline.
+- A target is trusted until proven otherwise, so startup doesn't black-hole traffic during the first interval.
+- Probes are not requests: they don't touch the breaker, the rate limiter or the cache. They can carry extra headers (`headers`), use `HEAD`, and accept specific statuses (`expectStatus`; default any 2xx). The two mechanisms complement each other: the breaker still catches failures a probe misses (a healthy `/healthz` over a broken endpoint).
+
 **Circuit breaker**, one per *target*, so one bad instance is ejected while the rest keep serving:
 
 ```
@@ -230,6 +246,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `upstreams.*` | `url` **or** `urls`, `balance` | `-`, `round-robin` | One backend, or several |
 | `upstreams.*` | `timeoutMs`, `totalTimeoutMs` | `5000`, unset | Per-attempt and overall timeouts |
 | `upstreams.*.tls` | `caFile` | unset | PEM bundle for a privately signed `https://` upstream; replaces the default trust store for that upstream |
+| `upstreams.*.healthCheck` | `path`, `method`, `intervalMs`, `timeoutMs`, `unhealthyThreshold`, `healthyThreshold`, `expectStatus`, `headers` | off; `GET`, `5000`, `2000`, `2`, `2`, any 2xx, none | Active probing. `timeoutMs` must be below `intervalMs`; probes may not set `Host`, framing or `Upgrade` headers |
 | `upstreams.*.retry` | `maxAttempts`, `baseDelayMs`, `maxDelayMs`, `retryOnStatus`, `retryNonIdempotent` | `3`, `100`, `2000`, `[502,503,504]`, `false` | |
 | `upstreams.*.breaker` | `failureRateThreshold`, `minimumRequests`, `windowMs`, `openDurationMs`, `halfOpenMaxCalls`, `halfOpenSuccesses` | `0.5`, `10`, `10000`, `10000`, `1`, `2` | Applied per target |
 | `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cache` | | Longest whole-segment prefix wins; `rateLimit: false` disables limiting |
@@ -243,7 +260,7 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 - `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats (token-gated when one is set)
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts;
-  - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target;
+  - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
 - One JSON access-log line per request with `requestId`, route, status, duration, cache result, attempt count and the registered key *name* (never the key). `X-Request-Id` is propagated upstream (client-supplied ids are accepted only if they're safe to log).
@@ -347,6 +364,7 @@ src/
     resilient.ts          failure modes + breaker around the store
   resilience/
     circuitBreaker.ts     rolling-window breaker with probe permits
+    healthChecker.ts      active-probe state machine (thresholds, jittered schedule)
     retry.ts              backoff, jitter, Retry-After
   cache/
     policy.ts             what may be stored, and for how long
@@ -366,7 +384,6 @@ Deliberate scope limits rather than oversights:
 - **One process, one core.** Node runs the request path on a single thread. Scale by running more instances: the design (shared limiter state in Redis) assumes it. See "Performance" for what one instance does on one core.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
-- **No active health checks.** A target is ejected by observed failures (passive), not by probing it in the background.
 - **Not an authentication system** (see "Security model").
 - **Sliding window log memory is O(limit) per key.** Use `sliding-window-counter` where the limit is large.
 - Request-weighted costs per route, weighted/zone-aware balancing and DNS-based service discovery are natural extensions.

@@ -31,6 +31,7 @@ import {
   RateLimiterUnavailableError,
 } from './ratelimit/types.js';
 import { CircuitBreaker, CircuitOpenError, type CircuitState, type Permit } from './resilience/circuitBreaker.js';
+import { HealthChecker, type ProbeResult } from './resilience/healthChecker.js';
 import { retry } from './resilience/retry.js';
 import { Router } from './router.js';
 
@@ -39,6 +40,8 @@ export interface GatewayDeps {
   clock?: Clock;
   /** Connected ioredis client. Without one, rate limiting is in-memory (single instance only). */
   redis?: Redis;
+  /** Don't start the background health-check timers; tests drive probes with checkHealthNow(). */
+  manualHealthChecks?: boolean;
   /** Test seams for deterministic retry timing. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
@@ -51,6 +54,8 @@ interface Target {
   breaker: CircuitBreaker;
   /** Requests sent to this target that have not yet received response headers. */
   pending: number;
+  /** Verdict of the active health check; true until a probe says otherwise (and always, without a check). */
+  healthy: boolean;
 }
 
 interface UpstreamRuntime {
@@ -59,6 +64,12 @@ interface UpstreamRuntime {
   targets: Target[];
   /** Rotates so equal-load targets take turns. */
   cursor: number;
+  /** Present when the upstream configures a health check. */
+  health?: {
+    checker: HealthChecker;
+    /** One dedicated client per target: probes must not queue behind (or be starved by) proxied traffic. */
+    clients: Map<string, UpstreamClient>;
+  };
 }
 
 interface RouteLimiter {
@@ -205,6 +216,14 @@ export class Gateway {
     'Upstream attempts by target and outcome.',
   );
   private readonly mTransitions = this.metrics.counter('gateway_circuit_transitions_total', 'Circuit state changes.');
+  private readonly mHealthChecks = this.metrics.counter(
+    'gateway_health_checks_total',
+    'Active health-check probes by target and result.',
+  );
+  private readonly mHealthTransitions = this.metrics.counter(
+    'gateway_health_transitions_total',
+    'Targets taken out of, or returned to, rotation by health checks.',
+  );
   private readonly mShed = this.metrics.counter(
     'gateway_requests_shed_total',
     'Requests refused to protect the gateway.',
@@ -251,6 +270,7 @@ export class Gateway {
         return {
           id,
           pending: 0,
+          healthy: true,
           client: new UpstreamClient(url, {
             timeoutMs: upstreamConfig.timeoutMs,
             maxConnections: upstreamConfig.maxConnections,
@@ -266,7 +286,11 @@ export class Gateway {
           }),
         };
       });
-      this.upstreams.set(name, { name, config: upstreamConfig, targets, cursor: 0 });
+      const runtime: UpstreamRuntime = { name, config: upstreamConfig, targets, cursor: 0 };
+      if (upstreamConfig.healthCheck) {
+        runtime.health = this.buildHealthCheck(runtime, upstreamConfig.healthCheck, ca);
+      }
+      this.upstreams.set(name, runtime);
     }
 
     for (const route of config.routes) {
@@ -313,7 +337,16 @@ export class Gateway {
         throw error;
       }
     }
+    if (!this.deps.manualHealthChecks) {
+      for (const u of this.upstreams.values()) u.health?.checker.start();
+    }
     return main;
+  }
+
+  /** Probe every target of every upstream (or one) right now and wait. Mainly for tests and operator tooling. */
+  async checkHealthNow(upstream?: string): Promise<void> {
+    const selected = upstream ? [this.upstreams.get(upstream)] : [...this.upstreams.values()];
+    await Promise.all(selected.map((u) => u?.health?.checker.probeAll()));
   }
 
   /** Stop accepting connections, let in-flight requests finish (up to the grace period), then release resources. */
@@ -339,7 +372,11 @@ export class Gateway {
     }
     this.stopProcessMetrics();
 
-    for (const { targets } of this.upstreams.values()) for (const target of targets) target.client.close();
+    for (const { targets, health } of this.upstreams.values()) {
+      health?.checker.stop();
+      for (const client of health?.clients.values() ?? []) client.close();
+      for (const target of targets) target.client.close();
+    }
     const limiters = [...this.limiterCache.values(), ...(this.ipCeiling ? [this.ipCeiling] : [])];
     await Promise.all(limiters.map(({ limiter }) => limiter.close?.()));
   }
@@ -437,6 +474,72 @@ export class Gateway {
     return base ? scaleRule(base, identity.multiplier) : undefined;
   }
 
+  /** Wire an upstream's health checker: a dedicated probe client per target and the effect of a verdict. */
+  private buildHealthCheck(
+    upstream: UpstreamRuntime,
+    hc: NonNullable<UpstreamConfig['healthCheck']>,
+    ca: Buffer | undefined,
+  ): NonNullable<UpstreamRuntime['health']> {
+    const clients = new Map<string, UpstreamClient>();
+    const urls = upstreamTargets(upstream.config);
+    upstream.targets.forEach((target, index) => {
+      clients.set(
+        target.id,
+        new UpstreamClient(urls[index] as string, { timeoutMs: hc.timeoutMs, maxConnections: 2, ca }),
+      );
+    });
+    const byId = new Map(upstream.targets.map((t) => [t.id, t]));
+    const expected = hc.expectStatus ? new Set(hc.expectStatus) : undefined;
+    const extraHeaders = Object.fromEntries(Object.entries(hc.headers).map(([k, v]) => [k.toLowerCase(), v]));
+
+    const checker = new HealthChecker(
+      upstream.targets.map((t) => t.id),
+      {
+        intervalMs: hc.intervalMs,
+        unhealthyThreshold: hc.unhealthyThreshold,
+        healthyThreshold: hc.healthyThreshold,
+        probe: (id) => this.probe(clients.get(id) as UpstreamClient, hc, expected, extraHeaders),
+        onResult: (id, result) =>
+          this.mHealthChecks.inc({ upstream: upstream.name, target: id, result: result.ok ? 'ok' : 'fail' }),
+        onChange: (id, healthy, reason) => {
+          const target = byId.get(id);
+          if (target) target.healthy = healthy;
+          this.mHealthTransitions.inc({ upstream: upstream.name, target: id, to: healthy ? 'healthy' : 'unhealthy' });
+          this.logger.warn('health check verdict changed', { upstream: upstream.name, target: id, healthy, reason });
+        },
+      },
+      this.clock,
+    );
+    return { checker, clients };
+  }
+
+  private async probe(
+    client: UpstreamClient,
+    hc: NonNullable<UpstreamConfig['healthCheck']>,
+    expected: Set<number> | undefined,
+    extraHeaders: Record<string, string>,
+  ): Promise<ProbeResult> {
+    try {
+      const res = await client.request({
+        method: hc.method,
+        path: client.resolvePath(hc.path),
+        headers: { accept: '*/*', 'user-agent': 'api-gateway-healthcheck', ...extraHeaders, host: client.host },
+        timeoutMs: hc.timeoutMs,
+      });
+      // We only wanted the status. Drain what little a health endpoint sends so the connection can be reused, but
+      // never trust it to stop: cut it off after the probe timeout.
+      const cutoff = setTimeout(() => res.stream.destroy(), hc.timeoutMs);
+      cutoff.unref();
+      res.stream.once('close', () => clearTimeout(cutoff));
+      res.stream.resume();
+      const ok = expected ? expected.has(res.status) : res.status >= 200 && res.status < 300;
+      return ok ? { ok, status: res.status } : { ok, status: res.status, reason: `status ${res.status}` };
+    } catch (error) {
+      // Only the failure *kind*: the message can carry addresses, and this ends up on the health page and in logs.
+      return { ok: false, reason: error instanceof UpstreamError ? error.kind : 'error' };
+    }
+  }
+
   private registerGauges(): void {
     this.metrics.gauge(
       'gateway_circuit_state',
@@ -448,6 +551,16 @@ export class Gateway {
             value: CIRCUIT_VALUE[t.breaker.state],
           })),
         ),
+    );
+    this.metrics.gauge(
+      'gateway_target_healthy',
+      'Active health-check verdict per target (1 healthy, 0 unhealthy). Only upstreams with a health check.',
+      () =>
+        [...this.upstreams.values()]
+          .filter((u) => u.health)
+          .flatMap((u) =>
+            u.targets.map((t) => ({ labels: { upstream: u.name, target: t.id }, value: t.healthy ? 1 : 0 })),
+          ),
     );
     this.metrics.gauge('gateway_cache_entries', 'Entries held in the response cache.', () => [
       { labels: {}, value: this.cache.stats().entries },
@@ -737,7 +850,11 @@ export class Gateway {
     const start = upstream.cursor;
     upstream.cursor = (upstream.cursor + 1) % n;
 
-    const order = upstream.targets.map((_, i) => upstream.targets[(start + i) % n] as Target);
+    let order = upstream.targets.map((_, i) => upstream.targets[(start + i) % n] as Target);
+    // Targets the health check has condemned are skipped, unless that would leave nothing: then the verdict is
+    // ignored ("panic mode") and the circuit breakers alone decide, so a broken probe can't take a service offline.
+    const inRotation = order.filter((t) => t.healthy);
+    if (inRotation.length > 0) order = inRotation;
     if (upstream.config.balance === 'least-pending') order.sort((a, b) => a.pending - b.pending); // stable
 
     for (const pass of [false, true]) {
@@ -1174,7 +1291,13 @@ export class Gateway {
     if (pathname === '/_gateway/health') {
       const upstreams: Record<string, unknown> = {};
       for (const u of this.upstreams.values()) {
-        const targets = u.targets.map((t) => ({ id: t.id, pending: t.pending, ...t.breaker.snapshot() }));
+        const targets = u.targets.map((t) => ({
+          id: t.id,
+          pending: t.pending,
+          healthy: t.healthy,
+          ...(u.health ? { healthCheck: u.health.checker.snapshot(t.id) } : {}),
+          ...t.breaker.snapshot(),
+        }));
         const states = new Set(targets.map((t) => t.state));
         upstreams[u.name] = {
           // The upstream can serve while any target is closed; it is open only if every target is.

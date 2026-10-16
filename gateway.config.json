@@ -21,6 +21,7 @@
       "url": "${UPSTREAM_URL:-http://localhost:9001}",
       "timeoutMs": 1000,
       "totalTimeoutMs": 2500,
+      "healthCheck": { "path": "/health", "intervalMs": 5000, "timeoutMs": 1000 },
       "retry": { "maxAttempts": 3, "baseDelayMs": 50, "maxDelayMs": 500, "retryOnStatus": [502, 503, 504] },
       "breaker": {
         "failureRateThreshold": 0.5,

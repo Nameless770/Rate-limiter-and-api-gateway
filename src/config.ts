@@ -46,6 +46,35 @@ const retrySchema = z.strictObject({
   retryNonIdempotent: z.boolean().default(false),
 });
 
+/** Request headers a health probe may not set: they are about framing or routing, not about what to ask. */
+const FORBIDDEN_PROBE_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade']);
+
+const healthCheckSchema = z.strictObject({
+  /** Path to request on each target. Joined with the target's own base path. */
+  path: z.string().startsWith('/'),
+  method: z.enum(['GET', 'HEAD']).default('GET'),
+  intervalMs: positiveInt.default(5_000),
+  /** A probe that takes longer than this counts as a failure. Keep it below intervalMs. */
+  timeoutMs: positiveInt.default(2_000),
+  /** Consecutive failed probes before a target is taken out of rotation. */
+  unhealthyThreshold: positiveInt.default(2),
+  /** Consecutive successful probes before it is put back. */
+  healthyThreshold: positiveInt.default(2),
+  /** Statuses that count as healthy. Default: any 2xx. */
+  expectStatus: z.array(z.number().int().min(100).max(599)).min(1).optional(),
+  /** Extra headers on every probe, e.g. a token the health endpoint expects. */
+  headers: z
+    .record(z.string().min(1), z.string())
+    .default({})
+    .superRefine((headers, ctx) => {
+      for (const name of Object.keys(headers)) {
+        if (FORBIDDEN_PROBE_HEADERS.has(name.toLowerCase())) {
+          ctx.addIssue({ code: 'custom', path: [name], message: `"${name}" cannot be set on a health probe` });
+        }
+      }
+    }),
+});
+
 const upstreamSchema = z
   .strictObject({
     /** A single backend. Use `urls` instead to spread load across several. Exactly one of the two. */
@@ -73,6 +102,12 @@ const upstreamSchema = z
     totalTimeoutMs: positiveInt.optional(),
     retry: retrySchema.prefault({}),
     breaker: breakerSchema.prefault({}),
+    /**
+     * Probe each target on a schedule and take unhealthy ones out of rotation, so traffic avoids a down target
+     * before any client request has to fail to find out. If every target is unhealthy the gateway ignores the
+     * verdict and tries them anyway (a wrong health path must not be able to take a service offline).
+     */
+    healthCheck: healthCheckSchema.optional(),
     tls: z
       .strictObject({
         /**
@@ -90,6 +125,13 @@ const upstreamSchema = z
       return;
     }
     const targets = upstreamTargets(upstream);
+    if (upstream.healthCheck && upstream.healthCheck.timeoutMs >= upstream.healthCheck.intervalMs) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['healthCheck', 'timeoutMs'],
+        message: 'must be shorter than intervalMs, or probes would overlap',
+      });
+    }
     if (new Set(targets).size !== targets.length) {
       ctx.addIssue({ code: 'custom', path: ['urls'], message: 'urls must not contain duplicates' });
     }
