@@ -571,14 +571,17 @@ describe('the upstream side of the handshake', () => {
   });
 
   it('answers 502, without detail, when no target can be reached, and counts the failures against the breaker', async () => {
-    let dead = '';
+    const dead: string[] = [];
     const t = await setup({
-      urls: (_up, deadUrl) => [(dead = deadUrl)],
+      urls: (_up, deadUrl) => {
+        dead.push(deadUrl);
+        return [deadUrl];
+      },
       upstream: { retry: { maxAttempts: 2 } },
     });
     const res = await t.open();
     expect(res.status).toBe(502);
-    expect(res.body).not.toContain(new URL(dead).port);
+    expect(res.body).not.toContain(new URL(dead[0] as string).port);
     expect(t.g.gateway.circuit('u')?.snapshot().failures).toBe(2);
   });
 
