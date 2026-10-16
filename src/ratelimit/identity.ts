@@ -88,6 +88,11 @@ export function scaleRule(rule: RateLimitRuleConfig, multiplier: number): RateLi
   return { ...rule, limit: Math.max(1, Math.ceil(rule.limit * multiplier)) };
 }
 
+/** The most a single request could ever spend under this rule: its whole allowance. */
+export function ruleAllowance(rule: RateLimitRuleConfig): number {
+  return rule.algorithm === 'token-bucket' ? rule.capacity : rule.limit;
+}
+
 /** A stable identity for a rule's parameters, used to cache one limiter per distinct rule. */
 export function ruleFingerprint(rule: RateLimitRuleConfig): string {
   return JSON.stringify(rule, Object.keys(rule).sort());

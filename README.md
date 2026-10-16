@@ -109,6 +109,15 @@ A rate limiter keyed on a client-supplied header is only as good as the header. 
 - IPv6 clients are grouped by **/64** (`ipv6Prefix`): a single subscriber is delegated 2^64 addresses and would otherwise mint a fresh identity per request. IPv4-mapped IPv6 is unified with plain IPv4.
 - Behind a proxy, set `trustedProxyHops`: the client address is the entry the outermost trusted proxy appended to `X-Forwarded-For`. The left side is client-controlled and is never used, and anything that doesn't parse as an address falls back to the socket, so attacker-chosen text is never a key.
 
+### Request cost
+
+A route can say what one request costs: `"cost": 10` on an export or a search lets one limit protect cheap and expensive endpoints alike, instead of forcing a single number that is too tight for one and too loose for the other.
+
+- It is charged against the caller's budget for that route, whether the response is served from the upstream or from the cache (the limiter runs first).
+- The cost is capped at the caller's *whole allowance*. An anonymous caller scaled down to a tenth of the quota might have an allowance of 1 against a route costing 10; capping means they can still make one request per refill instead of being locked out for ever.
+- A cost larger than the route's own limit is a startup error: no request could ever succeed.
+- The per-address ceiling always counts a request as 1. It exists to bound request volume, not work.
+
 ### When Redis is down
 
 A limiter on the hot path makes "what if the store is unavailable?" a policy decision. `rateLimit.failureMode`:
@@ -299,7 +308,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `upstreams.*.healthCheck` | `path`, `method`, `intervalMs`, `timeoutMs`, `unhealthyThreshold`, `healthyThreshold`, `expectStatus`, `headers` | off; `GET`, `5000`, `2000`, `2`, `2`, any 2xx, none | Active probing. `timeoutMs` must be below `intervalMs`; probes may not set `Host`, framing or `Upgrade` headers |
 | `upstreams.*.retry` | `maxAttempts`, `baseDelayMs`, `maxDelayMs`, `retryOnStatus`, `retryNonIdempotent` | `3`, `100`, `2000`, `[502,503,504]`, `false` | |
 | `upstreams.*.breaker` | `failureRateThreshold`, `minimumRequests`, `windowMs`, `openDurationMs`, `halfOpenMaxCalls`, `halfOpenSuccesses` | `0.5`, `10`, `10000`, `10000`, `1`, `2` | Applied per target |
-| `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cache` | | Longest whole-segment prefix wins; `rateLimit: false` disables limiting |
+| `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cost`, `cache` | `cost`: `1` | Longest whole-segment prefix wins; `rateLimit: false` disables limiting; `cost` is what a request spends of the budget |
 | `routes[].cache` | `ttlMs`, `varyHeaders`, `forwardHeaders` | `-`, `[authorization, x-api-key]`, `[accept, accept-language]` | See "Cache poisoning" |
 
 ## Observability
@@ -437,4 +446,4 @@ Deliberate scope limits rather than oversights:
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
 - **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation.
 - **Sliding window log memory is O(limit) per key.** Use `sliding-window-counter` where the limit is large.
-- Request-weighted costs per route, weighted/zone-aware balancing and DNS-based service discovery are natural extensions.
+- Weighted/zone-aware balancing and DNS-based service discovery are natural extensions.

@@ -225,6 +225,13 @@ const routeSchema = z.strictObject({
   /** Omit to inherit the global default; `false` disables limiting for this route. */
   rateLimit: z.union([rateLimitRuleSchema, z.literal(false)]).optional(),
   cache: routeCacheSchema.optional(),
+  /**
+   * What one request to this route spends from the caller's rate-limit budget. A route that does ten times the
+   * work (an export, a search, a report) can cost 10, so one limit protects expensive and cheap endpoints alike.
+   * Capped at the caller's whole allowance, so a request is never impossible: a caller scaled down to a tiny
+   * budget can still make one such request per refill.
+   */
+  cost: positiveInt.default(1),
   /** Authenticate callers on this route. Without it the gateway checks no credentials (it only rate limits). */
   auth: routeAuthSchema.optional(),
 });
@@ -443,6 +450,18 @@ export const configSchema = z
         }
       }
     });
+    cfg.routes.forEach((route, i) => {
+      const rule = route.rateLimit === undefined ? cfg.rateLimit.default : route.rateLimit || undefined;
+      const allowance = rule ? (rule.algorithm === 'token-bucket' ? rule.capacity : rule.limit) : undefined;
+      if (allowance !== undefined && route.cost > allowance) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'cost'],
+          message: `cost ${route.cost} exceeds the route's whole allowance of ${allowance}, so no request could ever succeed`,
+        });
+      }
+    });
+
     const issuerNames = new Set<string>();
     (cfg.auth.jwt?.issuers ?? []).forEach((issuer, i) => {
       if (issuerNames.has(issuer.name)) {

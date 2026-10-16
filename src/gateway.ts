@@ -20,7 +20,7 @@ import { Registry } from './observability/metrics.js';
 import { registerProcessMetrics } from './observability/process.js';
 import { sanitizeRequestId, stripHopByHop } from './proxy/headers.js';
 import { UpstreamClient, UpstreamError, type UpstreamResponse } from './proxy/upstream.js';
-import { type Identity, IdentityResolver, ruleFingerprint, scaleRule } from './ratelimit/identity.js';
+import { type Identity, IdentityResolver, ruleAllowance, ruleFingerprint, scaleRule } from './ratelimit/identity.js';
 import { memorySlidingWindow, memorySlidingWindowCounter, memoryTokenBucket } from './ratelimit/memory.js';
 import { RedisSlidingWindow, RedisSlidingWindowCounter, RedisTokenBucket } from './ratelimit/redis.js';
 import { ResilientRateLimiter } from './ratelimit/resilient.js';
@@ -779,7 +779,10 @@ export class Gateway {
     const rule = this.effectiveRule(routeId, identity);
     if (rule) {
       const { limiter, tag } = this.limiterFor(routeId, rule);
-      decision = await limiter.consume(`rl:${tag}:${routeId}:${identity.id}`);
+      // A caller scaled down (anonymous multiplier, a small override) may have less than the route costs: charge
+      // their whole allowance rather than an amount no request could ever pay.
+      const cost = Math.min(route.cost, ruleAllowance(rule));
+      decision = await limiter.consume(`rl:${tag}:${routeId}:${identity.id}`, cost);
     }
     if (!decision) return true;
 
