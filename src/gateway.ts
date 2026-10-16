@@ -1,8 +1,9 @@
 import { createHash, randomUUID, timingSafeEqual, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
+import http, { type IncomingHttpHeaders, type IncomingMessage, ServerResponse } from 'node:http';
 import https from 'node:https';
 import type { AddressInfo, Socket } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { createSecureContext, type TLSSocket } from 'node:tls';
 import type { Redis } from 'ioredis';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
@@ -22,6 +23,14 @@ import { Registry } from './observability/metrics.js';
 import { registerProcessMetrics } from './observability/process.js';
 import { sanitizeRequestId, stripHopByHop } from './proxy/headers.js';
 import { UpstreamClient, UpstreamError, type UpstreamResponse } from './proxy/upstream.js';
+import {
+  acceptKey,
+  checkUpstreamHandshake,
+  openTunnel,
+  originAllowed,
+  type Tunnel,
+  validateHandshake,
+} from './proxy/websocket.js';
 import { type Identity, IdentityResolver, ruleAllowance, ruleFingerprint, scaleRule } from './ratelimit/identity.js';
 import { memorySlidingWindow, memorySlidingWindowCounter, memoryTokenBucket } from './ratelimit/memory.js';
 import { RedisSlidingWindow, RedisSlidingWindowCounter, RedisTokenBucket } from './ratelimit/redis.js';
@@ -103,7 +112,14 @@ interface RequestContext {
   auth?: { method: 'api-key' | 'jwt'; client: string; issuer?: string };
   /** Why authentication failed. A short enumerated code, safe to log; never sent to the client. */
   authFailure?: string;
+  /** The connection was upgraded to a WebSocket: the response is a 101 the gateway wrote itself. */
+  switched?: boolean;
 }
+
+/** What a WebSocket handshake attempt came to: a connection to join, or the upstream's own refusal to relay. */
+type UpgradeResult =
+  | { kind: 'upgraded'; socket: Duplex; head: Buffer; protocol?: string; extensions?: string }
+  | { kind: 'rejected'; response: UpstreamResponse };
 
 interface StoreOptions {
   key: string;
@@ -159,6 +175,9 @@ const IDENTITY_HEADERS = ['x-authenticated-client', 'x-authenticated-method', 'x
 function headerSafe(value: string): string {
   return /^[\x20-\x7E]*$/.test(value) ? value : encodeURIComponent(value);
 }
+
+/** Most a client may send before it has its 101. A well-behaved one sends nothing; this only bounds a bad one. */
+const MAX_EARLY_WS_BYTES = 64 * 1024;
 
 /** Longest request path written to an access-log line. */
 const MAX_LOGGED_PATH = 512;
@@ -224,6 +243,12 @@ export class Gateway {
   private certNotAfter?: Date;
   /** Responses still in progress, so shutdown can ask them not to keep their connection alive. */
   private readonly active = new Set<ServerResponse>();
+  /** Joined WebSocket connections, so shutdown can end them (they would otherwise keep the server open forever). */
+  private readonly tunnels = new Set<Tunnel>();
+  /** Client sockets that have asked to upgrade, from the request until they close. */
+  private readonly upgradeSockets = new Set<Duplex>();
+  /** WebSockets open or being opened, per route. */
+  private readonly wsOpen = new Map<string, number>();
   private readonly connectionsByIp = new Map<string, number>();
   private connections = 0;
   private bufferedBytes = 0;
@@ -251,6 +276,14 @@ export class Gateway {
   private readonly mHealthTransitions = this.metrics.counter(
     'gateway_health_transitions_total',
     'Targets taken out of, or returned to, rotation by health checks.',
+  );
+  private readonly mWsClosed = this.metrics.counter(
+    'gateway_websocket_closed_total',
+    'WebSocket connections closed, by route and why.',
+  );
+  private readonly mWsBytes = this.metrics.counter(
+    'gateway_websocket_bytes_total',
+    'Bytes relayed over WebSocket connections, by route and direction.',
   );
   private readonly mShed = this.metrics.counter(
     'gateway_requests_shed_total',
@@ -387,6 +420,9 @@ export class Gateway {
     this.server.requestTimeout = limits.requestTimeoutMs;
     this.server.keepAliveTimeout = limits.keepAliveTimeoutMs;
     this.server.on('connection', (socket) => this.trackConnection(socket));
+    this.server.on('upgrade', (req, socket, head) => {
+      void this.handleUpgrade(req, socket, head);
+    });
 
     this.adminServer = http.createServer({ maxHeaderSize: 8 * 1024 }, (req, res) => this.handleAdmin(req, res));
     this.adminServer.headersTimeout = 5_000;
@@ -468,6 +504,10 @@ export class Gateway {
   /** Stop accepting connections, let in-flight requests finish (up to the grace period), then release resources. */
   async close(graceMs = this.config.shutdownGraceMs): Promise<void> {
     this.closing = true;
+    // An upgraded socket is no longer tracked as an HTTP connection, yet it still holds server.close() open, and a
+    // WebSocket has no response to wait for. End them now; their clients reconnect (to another instance, in a fleet).
+    for (const tunnel of [...this.tunnels]) tunnel.close('shutdown');
+    for (const socket of this.upgradeSockets) socket.destroy();
     const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
     // Idle keep-alive connections go now. Busy ones are told not to be reused and are closed as soon as their
     // response completes (see finish()), so clients don't send new requests into a process that is exiting.
@@ -686,6 +726,9 @@ export class Gateway {
           ? [{ labels: {}, value: Math.round((this.certNotAfter.getTime() - this.clock()) / 1000) }]
           : [],
     );
+    this.metrics.gauge('gateway_websocket_connections', 'WebSocket connections open or being opened, per route.', () =>
+      [...this.wsOpen].map(([route, value]) => ({ labels: { route }, value })),
+    );
     this.metrics.gauge('gateway_cache_entries', 'Entries held in the response cache.', () => [
       { labels: {}, value: this.cache.stats().entries },
     ]);
@@ -730,10 +773,9 @@ export class Gateway {
   // Request pipeline
   // ------------------------------------------------------------------------------------------------------------------
 
-  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const requestId = sanitizeRequestId(req.headers['x-request-id']) ?? randomUUID();
-    const ctx: RequestContext = {
-      requestId,
+  private newContext(req: IncomingMessage): RequestContext {
+    return {
+      requestId: sanitizeRequestId(req.headers['x-request-id']) ?? randomUUID(),
       method: req.method ?? 'GET',
       path: '',
       route: '-',
@@ -745,13 +787,16 @@ export class Gateway {
       upstreamTruncated: false,
       buffered: 0,
     };
-    res.setHeader('x-request-id', requestId);
+  }
+
+  /** The headers every response carries, and the bookkeeping that runs when the response (or its connection) ends. */
+  private trackResponse(res: ServerResponse, ctx: RequestContext): void {
+    res.setHeader('x-request-id', ctx.requestId);
     if (this.config.tls?.hstsMaxAgeSeconds) {
       res.setHeader('strict-transport-security', `max-age=${this.config.tls.hstsMaxAgeSeconds}`);
     }
     if (this.closing) res.setHeader('connection', 'close');
 
-    const shed = this.active.size >= this.config.limits.maxInFlight;
     this.active.add(res);
     res.once('close', () => {
       this.active.delete(res);
@@ -759,6 +804,12 @@ export class Gateway {
       if (!res.writableFinished) ctx.clientGone = true;
       this.finish(res, ctx);
     });
+  }
+
+  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const ctx = this.newContext(req);
+    const shed = this.active.size >= this.config.limits.maxInFlight;
+    this.trackResponse(res, ctx);
 
     try {
       if (shed) throw new OverloadedError('too many requests in flight');
@@ -1097,10 +1148,6 @@ export class Gateway {
     store?: StoreOptions,
     forwardOnly?: string[],
   ): Promise<RelayOutcome> {
-    const { retry: policy } = upstream.config;
-    const retryStatuses = new Set(policy.retryOnStatus);
-    const mayRetryUnsafe = IDEMPOTENT.has(ctx.method) || policy.retryNonIdempotent;
-
     // Abort in-flight work (including backoff sleeps) the moment the client goes away.
     const abort = new AbortController();
     const onClose = (): void => {
@@ -1109,6 +1156,50 @@ export class Gateway {
     res.once('close', onClose);
 
     const headers = this.upstreamHeaders(req, ctx, body, store !== undefined, forwardOnly);
+
+    try {
+      const response = await this.callUpstream<UpstreamResponse>(upstream, ctx, abort.signal, {
+        send: (target, timeoutMs) =>
+          target.client.request({
+            method: ctx.method,
+            path: target.client.resolvePath(relativePath),
+            headers: { ...headers, host: target.client.host },
+            body,
+            signal: abort.signal,
+            timeoutMs,
+          }),
+        status: (result) => result.status,
+        headers: (result) => result.headers,
+        discard: (result) => result.stream.resume(),
+      });
+      return await this.relay(res, ctx, response, store);
+    } finally {
+      res.off('close', onClose);
+    }
+  }
+
+  /**
+   * One logical call to an upstream: choose a target, take its breaker permit, make an attempt, record how it
+   * went, and retry per the upstream's policy (backoff with jitter, bounded by the overall deadline). The caller
+   * supplies what a single attempt does and how to read its outcome, so plain requests and WebSocket handshakes
+   * share one retry and circuit-breaking policy instead of two copies of it.
+   */
+  private async callUpstream<T>(
+    upstream: UpstreamRuntime,
+    ctx: RequestContext,
+    signal: AbortSignal,
+    call: {
+      /** A single attempt against `target`, to finish within `timeoutMs`. */
+      send(target: Target, timeoutMs: number): Promise<T>;
+      status(result: T): number;
+      headers(result: T): IncomingHttpHeaders;
+      /** Release a result that is being replaced by another attempt. */
+      discard(result: T): void;
+    },
+  ): Promise<T> {
+    const { retry: policy } = upstream.config;
+    const retryStatuses = new Set(policy.retryOnStatus);
+    const mayRetryUnsafe = IDEMPOTENT.has(ctx.method) || policy.retryNonIdempotent;
     const tried = new Set<Target>();
 
     // Overall deadline across attempts and backoff sleeps (real time: it bounds how long a client waits).
@@ -1116,84 +1207,303 @@ export class Gateway {
     const deadline = totalTimeoutMs === undefined ? undefined : performance.now() + totalTimeoutMs;
     const budgetLeftMs = (): number => (deadline === undefined ? Infinity : deadline - performance.now());
 
+    return retry(
+      async (attempt) => {
+        // Re-check after any backoff sleep: no point starting an attempt that cannot finish in time.
+        if (attempt > 1 && budgetLeftMs() < MIN_ATTEMPT_BUDGET_MS) {
+          throw new UpstreamError('timeout', `overall deadline of ${totalTimeoutMs}ms exceeded`);
+        }
+        const picked = this.pickTarget(upstream, tried);
+        if (!picked) throw new CircuitOpenError(this.retryAfterMs(upstream));
+        const { target, permit } = picked;
+        tried.add(target);
+        ctx.attempts++;
+        target.pending++;
+        try {
+          const result = await call.send(target, Math.max(1, Math.min(upstream.config.timeoutMs, budgetLeftMs())));
+          const failed = call.status(result) >= 500;
+          if (failed) permit.failure();
+          else permit.success();
+          this.mAttempts.inc({ upstream: upstream.name, target: target.id, outcome: failed ? 'status_5xx' : 'ok' });
+          return result;
+        } catch (error) {
+          const aborted = error instanceof UpstreamError && error.kind === 'aborted';
+          if (aborted) permit.release();
+          else permit.failure();
+          this.mAttempts.inc({
+            upstream: upstream.name,
+            target: target.id,
+            outcome: error instanceof UpstreamError ? error.kind : 'error',
+          });
+          throw error;
+        } finally {
+          target.pending--;
+        }
+      },
+      {
+        maxAttempts: policy.maxAttempts,
+        backoff: { baseDelayMs: policy.baseDelayMs, maxDelayMs: policy.maxDelayMs },
+        signal,
+        sleep: this.deps.sleep,
+        random: this.deps.random,
+        shouldRetry: (outcome) => {
+          if (budgetLeftMs() < MIN_ATTEMPT_BUDGET_MS) return false;
+          if (outcome.ok) return retryStatuses.has(call.status(outcome.value)) && mayRetryUnsafe;
+          const error = outcome.error;
+          if (!(error instanceof UpstreamError)) return false;
+          switch (error.kind) {
+            case 'aborted': // the client left; nobody is waiting for the answer
+            case 'tls': // a certificate problem won't fix itself between attempts
+            case 'protocol': // an upstream that answers wrongly will answer wrongly again
+              return false;
+            case 'connect': // nothing was sent, so even POST is safe to retry
+              return true;
+            default:
+              return mayRetryUnsafe;
+          }
+        },
+        retryAfterMs: (outcome) =>
+          outcome.ok ? parseRetryAfterMs(call.headers(outcome.value)['retry-after']) : undefined,
+        discard: (result) => call.discard(result),
+        onRetry: ({ attempt, delayMs, outcome }) =>
+          this.logger.debug('retrying upstream call', {
+            requestId: ctx.requestId,
+            upstream: upstream.name,
+            attempt,
+            delayMs,
+            reason: outcome.ok ? `status ${call.status(outcome.value)}` : (outcome.error as Error).message,
+          }),
+      },
+    );
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // WebSocket
+  // ------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * An Upgrade request. Once the server has an 'upgrade' listener Node hands every such request here and none to
+   * the ordinary handler, so this refuses everything that is not a WebSocket handshake on a route that opted in.
+   *
+   * The checks are the ones an ordinary request gets (origin, address ceiling, authentication, the route's rate
+   * limit), and a refusal is an ordinary HTTP response written on the raw socket. Only then is the upstream asked
+   * to switch protocols; once it agrees the two sockets are joined and the gateway moves bytes without looking at
+   * them.
+   */
+  private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    socket.on('error', () => {}); // a reset before the tunnel exists must not be fatal
+    this.upgradeSockets.add(socket);
+    socket.once('close', () => this.upgradeSockets.delete(socket));
+
+    const ctx = this.newContext(req);
+    // Reuse the response machinery (error bodies, rate-limit headers, access log) by giving the socket a response
+    // object, exactly as Node does for a normal request. A successful upgrade detaches it again.
+    const res = new ServerResponse(req);
+    res.assignSocket(socket as Socket);
+    const shed = this.active.size >= this.config.limits.maxInFlight;
+    this.trackResponse(res, ctx);
+    res.setHeader('connection', 'close'); // this socket never goes back to the HTTP parser
+    res.once('finish', () => closeSoon(socket));
+
+    // While the handshake is in progress nothing reads this socket, so a client that hangs up would go unnoticed and
+    // its upstream attempt would run to completion. Read it, keeping what arrives: a client is not supposed to send
+    // before it has the 101, but if it does, those bytes belong to the upstream and must not be lost.
+    const abort = new AbortController();
+    const early: Buffer[] = head.length > 0 ? [head] : [];
+    let earlyBytes = head.length;
+    const onEarlyData = (chunk: Buffer): void => {
+      earlyBytes += chunk.length;
+      if (earlyBytes > MAX_EARLY_WS_BYTES) socket.destroy();
+      else early.push(chunk);
+    };
+    const onHangUp = (): void => {
+      abort.abort();
+      socket.destroy();
+    };
+    socket.on('data', onEarlyData);
+    socket.once('end', onHangUp);
+    socket.once('close', () => abort.abort());
+
+    let routeId: string | undefined;
+    let tunneled = false;
     try {
-      const response = await retry(
-        async (attempt) => {
-          // Re-check after any backoff sleep: no point starting an attempt that cannot finish in time.
-          if (attempt > 1 && budgetLeftMs() < MIN_ATTEMPT_BUDGET_MS) {
-            throw new UpstreamError('timeout', `overall deadline of ${totalTimeoutMs}ms exceeded`);
+      if (this.closing) {
+        return this.sendError(res, ctx, 503, 'shutting_down', 'the gateway is shutting down', { 'retry-after': 1 });
+      }
+      if (shed) throw new OverloadedError('too many requests in flight');
+
+      let url: URL;
+      try {
+        url = new URL(req.url ?? '/', 'http://gateway.invalid');
+      } catch {
+        return this.sendError(res, ctx, 400, 'bad_request', 'malformed request target');
+      }
+      ctx.path = url.pathname;
+      if (url.pathname === '/_gateway' || url.pathname.startsWith('/_gateway/')) {
+        return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
+      }
+
+      const match = this.router.match(url.pathname, 'GET');
+      const ws = match?.route.websocket;
+      if (!match || !ws) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
+      ctx.route = match.routeId;
+
+      const handshake = validateHandshake(req);
+      if (!handshake.ok) {
+        return this.sendError(res, ctx, handshake.status, handshake.code, handshake.message, handshake.headers);
+      }
+
+      // Before anything that costs: a page on another site must not get as far as authentication.
+      if (!originAllowed(req.headers.origin, ws.allowedOrigins, ws.allowAnyOrigin)) {
+        this.logger.warn('websocket origin refused', {
+          requestId: ctx.requestId,
+          route: match.routeId,
+          origin: String(req.headers.origin).slice(0, 200),
+        });
+        return this.sendError(res, ctx, 403, 'origin_not_allowed', 'this origin may not open a websocket here');
+      }
+
+      if (!(await this.admitted(req, res, ctx, match.route, match.routeId))) return;
+
+      // Reserved before the first await below, so concurrent handshakes cannot all slip under the cap.
+      const open = this.wsOpen.get(match.routeId) ?? 0;
+      if (open >= ws.maxConnections) {
+        this.mShed.inc({ reason: 'websocket_limit' });
+        return this.sendError(res, ctx, 503, 'too_many_websockets', 'too many websocket connections; retry later', {
+          'retry-after': 5,
+        });
+      }
+      this.wsOpen.set(match.routeId, open + 1);
+      routeId = match.routeId;
+
+      const upstream = this.upstreams.get(match.route.upstream) as UpstreamRuntime;
+      ctx.upstream = upstream.name;
+      const relativePath = match.upstreamPath + url.search;
+      const headers = this.websocketHeaders(req, ctx, handshake);
+
+      const result = await this.callUpstream<UpgradeResult>(upstream, ctx, abort.signal, {
+        send: async (target, timeoutMs) => {
+          const outcome = await target.client.upgrade({
+            path: target.client.resolvePath(relativePath),
+            headers: { ...headers, host: target.client.host },
+            signal: abort.signal,
+            timeoutMs,
+          });
+          if (outcome.kind === 'rejected') return outcome;
+          // Trust nothing the upstream says until it checks out: a wrong accept key or a subprotocol the client
+          // never offered means the two ends are not talking the protocol the client asked for.
+          const verdict = checkUpstreamHandshake(outcome.headers, handshake);
+          if (!verdict.ok) {
+            outcome.socket.destroy();
+            throw new UpstreamError('protocol', verdict.reason);
           }
-          const picked = this.pickTarget(upstream, tried);
-          if (!picked) throw new CircuitOpenError(this.retryAfterMs(upstream));
-          const { target, permit } = picked;
-          tried.add(target);
-          ctx.attempts++;
-          target.pending++;
-          try {
-            const result = await target.client.request({
-              method: ctx.method,
-              path: target.client.resolvePath(relativePath),
-              headers: { ...headers, host: target.client.host },
-              body,
-              signal: abort.signal,
-              timeoutMs: Math.max(1, Math.min(upstream.config.timeoutMs, budgetLeftMs())),
-            });
-            const failed = result.status >= 500;
-            if (failed) permit.failure();
-            else permit.success();
-            this.mAttempts.inc({ upstream: upstream.name, target: target.id, outcome: failed ? 'status_5xx' : 'ok' });
-            return result;
-          } catch (error) {
-            const aborted = error instanceof UpstreamError && error.kind === 'aborted';
-            if (aborted) permit.release();
-            else permit.failure();
-            this.mAttempts.inc({
-              upstream: upstream.name,
-              target: target.id,
-              outcome: error instanceof UpstreamError ? error.kind : 'error',
-            });
-            throw error;
-          } finally {
-            target.pending--;
-          }
+          return {
+            kind: 'upgraded',
+            socket: outcome.socket,
+            head: outcome.head,
+            protocol: verdict.protocol,
+            extensions: verdict.extensions,
+          };
         },
-        {
-          maxAttempts: policy.maxAttempts,
-          backoff: { baseDelayMs: policy.baseDelayMs, maxDelayMs: policy.maxDelayMs },
-          signal: abort.signal,
-          sleep: this.deps.sleep,
-          random: this.deps.random,
-          shouldRetry: (outcome) => {
-            if (budgetLeftMs() < MIN_ATTEMPT_BUDGET_MS) return false;
-            if (outcome.ok) return retryStatuses.has(outcome.value.status) && mayRetryUnsafe;
-            const error = outcome.error;
-            if (!(error instanceof UpstreamError)) return false;
-            switch (error.kind) {
-              case 'aborted': // the client left; nobody is waiting for the answer
-              case 'tls': // a certificate problem won't fix itself between attempts
-                return false;
-              case 'connect': // nothing was sent, so even POST is safe to retry
-                return true;
-              default:
-                return mayRetryUnsafe;
-            }
-          },
-          retryAfterMs: (outcome) => (outcome.ok ? parseRetryAfterMs(outcome.value.headers['retry-after']) : undefined),
-          discard: (value) => value.stream.resume(),
-          onRetry: ({ attempt, delayMs, outcome }) =>
-            this.logger.debug('retrying upstream call', {
-              requestId: ctx.requestId,
-              upstream: upstream.name,
-              attempt,
-              delayMs,
-              reason: outcome.ok ? `status ${outcome.value.status}` : (outcome.error as Error).message,
-            }),
+        status: (outcome) => (outcome.kind === 'upgraded' ? 101 : outcome.response.status),
+        headers: (outcome) => (outcome.kind === 'upgraded' ? {} : outcome.response.headers),
+        discard: (outcome) => {
+          if (outcome.kind === 'upgraded') outcome.socket.destroy();
+          else outcome.response.stream.resume();
         },
-      );
-      return await this.relay(res, ctx, response, store);
+      });
+
+      if (result.kind === 'rejected') {
+        // The upstream declined to upgrade (it wants a login, there is no such socket): pass its answer on.
+        await this.relay(res, ctx, result.response);
+        return;
+      }
+      if (socket.destroyed) {
+        result.socket.destroy(); // the client gave up while we were waiting
+        return;
+      }
+
+      // Hand-written 101: every value in it is either ours or was checked to be printable ASCII.
+      const lines = [
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${acceptKey(handshake.key)}`,
+        `X-Request-Id: ${ctx.requestId}`,
+      ];
+      if (result.protocol !== undefined) lines.push(`Sec-WebSocket-Protocol: ${result.protocol}`);
+      if (result.extensions !== undefined) lines.push(`Sec-WebSocket-Extensions: ${result.extensions}`);
+
+      ctx.switched = true;
+      res.detachSocket(socket as Socket); // from here on the bytes are not HTTP
+      this.active.delete(res);
+      this.finish(res, ctx);
+
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+      if (result.head.length > 0) socket.write(result.head); // frames the upstream sent right behind its 101
+      socket.off('data', onEarlyData); // the tunnel reads from here on, in this same tick
+      socket.off('end', onHangUp);
+      if (early.length > 0) result.socket.write(Buffer.concat(early)); // the client's, from behind its request
+
+      const opened = performance.now();
+      const route = ctx.route;
+      const tunnel = openTunnel(socket, result.socket, {
+        idleTimeoutMs: ws.idleTimeoutMs,
+        maxDurationMs: ws.maxDurationMs,
+        onClose: (reason, fromClient, fromUpstream) => {
+          this.tunnels.delete(tunnel);
+          this.releaseWebsocketSlot(route);
+          this.mWsClosed.inc({ route, reason });
+          this.mWsBytes.inc({ route, direction: 'client_to_upstream' }, fromClient);
+          this.mWsBytes.inc({ route, direction: 'upstream_to_client' }, fromUpstream);
+          this.logger.info('websocket closed', {
+            requestId: ctx.requestId,
+            route,
+            client: ctx.client,
+            reason,
+            durationMs: Math.round(performance.now() - opened),
+            bytesFromClient: fromClient,
+            bytesFromUpstream: fromUpstream,
+          });
+        },
+      });
+      this.tunnels.add(tunnel);
+      tunneled = true;
+    } catch (error) {
+      this.fail(res, ctx, error);
     } finally {
-      res.off('close', onClose);
+      if (routeId !== undefined && !tunneled) this.releaseWebsocketSlot(routeId);
     }
+  }
+
+  private releaseWebsocketSlot(routeId: string): void {
+    const left = (this.wsOpen.get(routeId) ?? 1) - 1;
+    if (left <= 0) this.wsOpen.delete(routeId);
+    else this.wsOpen.set(routeId, left);
+  }
+
+  /**
+   * Headers for the upstream's side of the handshake. Everything that is not the handshake itself is built the way
+   * it is for any proxied request (forwarding headers, verified identity, no client-supplied identity headers); the
+   * handshake headers are then set from what was validated, not copied, because the hop-by-hop stripping that keeps
+   * a client's own `Connection` list out of an ordinary request also strips them.
+   */
+  private websocketHeaders(
+    req: IncomingMessage,
+    ctx: RequestContext,
+    handshake: { key: string },
+  ): Record<string, string | string[]> {
+    const headers = this.upstreamHeaders(req, ctx, undefined, false);
+    headers['connection'] = 'Upgrade';
+    headers['upgrade'] = 'websocket';
+    headers['sec-websocket-version'] = '13';
+    headers['sec-websocket-key'] = handshake.key;
+    for (const name of ['sec-websocket-protocol', 'sec-websocket-extensions']) {
+      const value = req.headers[name];
+      if (value === undefined) delete headers[name];
+      else headers[name] = Array.isArray(value) ? value.join(', ') : value;
+    }
+    return headers;
   }
 
   /** When an upstream with every target open will next let a probe through. */
@@ -1577,7 +1887,7 @@ export class Gateway {
     const completed = res.writableFinished;
     // An unfinished response is either a truncated upstream body (a gateway error) or the client leaving
     // (nginx's 499 "client closed request").
-    const status = completed ? res.statusCode : ctx.upstreamTruncated ? 502 : 499;
+    const status = ctx.switched ? 101 : completed ? res.statusCode : ctx.upstreamTruncated ? 502 : 499;
     this.mRequests.inc({ route: ctx.route, status });
     this.mLatency.observe(durationMs / 1000, { route: ctx.route });
     if (ctx.cache) this.mCache.inc({ route: ctx.route, result: ctx.cache });
@@ -1608,6 +1918,19 @@ function listenOn(server: http.Server, port: number, host: string): Promise<Addr
       resolve(server.address() as AddressInfo);
     });
   });
+}
+
+/**
+ * End a connection after its last response has been handed to the OS. Reading (and discarding) what the peer still
+ * sends lets its FIN arrive so the close completes; closing with unread data would reset the connection and could
+ * lose the response. A peer that never closes is cut off after a short wait.
+ */
+function closeSoon(socket: Duplex): void {
+  socket.resume();
+  socket.end();
+  const timer = setTimeout(() => socket.destroy(), 2_000);
+  timer.unref();
+  socket.once('close', () => clearTimeout(timer));
 }
 
 function waitForDrain(res: ServerResponse): Promise<void> {

@@ -284,6 +284,42 @@ The proxy listener can terminate TLS itself, so the gateway can face clients dir
 - **`X-Forwarded-Proto`** tells the upstream the truth: `https` for clients on this listener. `hstsMaxAgeSeconds` adds `Strict-Transport-Security`; leave it unset until you are certain every client can use HTTPS.
 - The admin listener stays plain HTTP on loopback; its bearer token is not meant to cross a network.
 
+## WebSockets
+
+A route proxies WebSocket connections only if it asks to:
+
+```json
+{
+  "path": "/chat", "upstream": "chat",
+  "auth": { "methods": ["api-key", "jwt"] },
+  "websocket": {
+    "allowedOrigins": ["https://app.example.com"],
+    "idleTimeoutMs": 60000,
+    "maxDurationMs": 3600000,
+    "maxConnections": 1000
+  }
+}
+```
+
+**What is checked, in order, before the upstream is bothered.** Opening a connection is an ordinary request as far as the gateway's defences go:
+
+1. **Shape.** `GET`, `Upgrade: websocket` (and nothing else: `h2c` and every other protocol upgrade is refused, because they would let a client talk to the upstream in ways none of these checks saw), version 13, a well-formed key, no body. Anything else is a `400`/`405`/`426` and never reaches the upstream. A route without `websocket` answers `404` to an upgrade.
+2. **Origin.** A browser attaches the user's cookies to a WebSocket opened by *any* page on *any* site, and the `Origin` header is the only thing that says which site that was (a page cannot forge it). Without a check, a page on `evil.example` can open a socket to your service as your logged-in user: cross-site WebSocket hijacking. The `Origin` must be in `allowedOrigins` (exact match, case-insensitive; `Origin: null` and a repeated header are refused). Clients that send no `Origin` are scripts and native apps, not browsers, and are admitted. `allowAnyOrigin` opts out and the startup log says so. This runs *before* authentication and rate limiting, so a hostile page can neither burn a user's quota nor probe credentials.
+3. **Address ceiling, authentication, route rate limit** (with the route's `cost`), exactly as for HTTP. Opening a connection spends from the budget; messages on an open connection do not (see below).
+4. **Capacity.** `maxConnections` per route and the global in-flight limit answer `503` rather than queueing.
+
+Browsers cannot set `Authorization` or `X-API-Key` on a `new WebSocket(...)`, so header credentials suit servers and native clients. For a browser page, authenticate with a cookie at the upstream (a route without `auth`, or `required: false`), and rely on `allowedOrigins` to keep other sites out.
+
+**The upstream's side.** The handshake is sent with the gateway's own forwarding headers and verified identity (client-supplied `X-Authenticated-*` are stripped, as always), and balanced, retried and circuit-broken like a `GET`: a refused connection moves to the next target, a `503` is retried per the retry policy, an upstream that answers with an ordinary refusal (a `401`, a `404`) has its status, headers and body relayed. The upstream's `101` is not taken on trust: the `Sec-WebSocket-Accept` must match the client's key, and it may only select a subprotocol the client offered and an extension the client asked for; otherwise the connection is refused with `502`, counted as an upstream failure and not retried.
+
+**After the `101`, the gateway moves bytes and does not read frames.** Subprotocols and extensions such as `permessage-deflate` are negotiated end to end. The consequences:
+
+- It **cannot rate limit individual messages**; the controls are who may connect, how many at once (`maxConnections`), how long a quiet connection lives (`idleTimeoutMs`: no traffic in either direction, so ping/pong keeps a healthy one alive) and how long any connection lives (`maxDurationMs`). If the upstream needs per-message limits, it has to apply them.
+- A peer that hangs up and never finishes closing is cut off after a second; neither the HTTP header and request timeouts nor keep-alive settings apply to an upgraded connection.
+- **Shutdown does not drain** them (there is no response to wait for): open connections are closed immediately and their clients reconnect, to another instance in a fleet.
+
+Observability: the handshake is one access-log line with status `101`; when the connection ends, a `websocket closed` line has the reason (`client`, `upstream`, `idle`, `max_duration`, `shutdown`, `error`), lifetime and bytes each way. Metrics: `gateway_websocket_connections`, `gateway_websocket_closed_total{reason}` and `gateway_websocket_bytes_total{direction}`.
+
 ## Behaviour at the edges
 
 | Situation | What happens |
@@ -326,6 +362,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `upstreams.*.retry` | `maxAttempts`, `baseDelayMs`, `maxDelayMs`, `retryOnStatus`, `retryNonIdempotent` | `3`, `100`, `2000`, `[502,503,504]`, `false` | |
 | `upstreams.*.breaker` | `failureRateThreshold`, `minimumRequests`, `windowMs`, `openDurationMs`, `halfOpenMaxCalls`, `halfOpenSuccesses` | `0.5`, `10`, `10000`, `10000`, `1`, `2` | Applied per target |
 | `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cost`, `cache` | `cost`: `1` | Longest whole-segment prefix wins; `rateLimit: false` disables limiting; `cost` is what a request spends of the budget |
+| `routes[].websocket` | `allowedOrigins`, `allowAnyOrigin`, `idleTimeoutMs`, `maxDurationMs`, `maxConnections` | `[]`, `false`, `60000`, unset, `1000` | Proxy WebSocket upgrades on this route (see "WebSockets"). Off unless present; cannot be combined with `cache` |
 | `routes[].cache` | `ttlMs`, `varyHeaders`, `forwardHeaders` | `-`, `[authorization, x-api-key]`, `[accept, accept-language]` | See "Cache poisoning" |
 
 ## Observability
@@ -337,6 +374,7 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
   - TLS handshake failures by cause and certificate expiry;
+  - open WebSockets per route, closes by reason, bytes relayed each way;
   - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
@@ -410,6 +448,7 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
 - **Unit tests** drive the algorithms, breaker and retry loop with injected clocks, so boundary conditions are exact rather than timing-dependent.
 - **End-to-end tests** run the real gateway against real HTTP servers acting as upstreams: proxying, headers, limits, caching, coalescing, retries, timeouts, breaker lifecycle, balancing, per-target ejection, and the Redis failure modes (via a stub client).
 - **Security and hardening tests** ([`gateway.security.test.ts`](test/gateway.security.test.ts), [`hardening.test.ts`](test/hardening.test.ts)) attack the gateway: key rotation, cache poisoning, header spoofing, smuggling-shaped framing, slowloris, resource exhaustion.
+- **WebSocket tests** ([`gateway.websocket.test.ts`](test/gateway.websocket.test.ts), [`websocket.test.ts`](test/websocket.test.ts)) speak the protocol to the gateway with a hand-written client and an echo upstream, so no library helps the gateway pass: handshake validation, origin checks, h2c refusal, authentication and limits, the upstream handshake, idle and lifetime limits, half-closed peers, shutdown, `wss://` on both sides.
 - **Edge-case tests** ([`gateway.edge.test.ts`](test/gateway.edge.test.ts)): `HEAD`, chunked uploads, upstreams dying mid-body, HTTPS upstreams, clients leaving during coalesced fetches, graceful shutdown.
 - **Redis integration tests** run the Lua scripts against a real Redis. They check exact parity with the in-memory implementation over randomized sequences, and exactly-`limit` admission under a concurrent flood from several clients. They are skipped unless `REDIS_URL` is set:
 
@@ -420,7 +459,7 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
 
 - **Process test** ([`test/process.test.ts`](test/process.test.ts)) starts the real entrypoint and sends it `SIGTERM` mid-request (Linux/macOS).
 
-The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, and the Lua off-by-ones), a test fails.
+The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones, and for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown), a test fails.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint, the suite against a Redis service container on Node 22 and 24, a production-dependency audit, and a Docker image smoke test. Lint and format are [Biome](https://biomejs.dev) (`npm run lint`, `npm run lint:fix`).
 
@@ -433,10 +472,10 @@ src/
   router.ts               longest-prefix routing on path-segment boundaries
   security.ts             startup notes for risky-but-legal settings
   net/ip.ts               address normalization (IPv4-mapped, IPv6 /64)
+  auth/jwt.ts             JWT verification (HS256/RS256/ES256) and key loading
   ratelimit/
     algorithms.ts         pure token bucket, sliding window log, sliding window counter
     identity.ts           key registry, plans, overrides, rule scaling
-  auth/jwt.ts             JWT verification (HS256/RS256/ES256) and key loading
     memory.ts             in-process limiters (bounded key space)
     redis.ts              Lua scripts + Redis limiters
     resilient.ts          failure modes + breaker around the store
@@ -447,7 +486,7 @@ src/
   cache/
     policy.ts             what may be stored, and for how long
     responseCache.ts      LRU + byte budget + single-flight
-  proxy/                  upstream HTTP client, hop-by-hop header handling
+  proxy/                  upstream HTTP client (requests and upgrades), hop-by-hop headers, WebSocket handshake rules and tunnel
   observability/          logger, Prometheus registry, process metrics
 test/                     unit, end-to-end, security, protocol hardening, Redis integration, process signals
 bench/                    load generator, benchmark, soak test, CPU profiler
@@ -458,7 +497,7 @@ demo/                     flaky upstream and load script
 
 Deliberate scope limits rather than oversights:
 
-- **HTTP/1.1 only.** No HTTP/2 or HTTP/3, and no WebSocket or `Upgrade` proxying.
+- **HTTP/1.1 only.** No HTTP/2 or HTTP/3 (so no WebSockets over HTTP/2 either). WebSockets are proxied as opaque byte tunnels: no per-message limits (see "WebSockets").
 - **One process, one core.** Node runs the request path on a single thread. Scale by running more instances: the design (shared limiter state in Redis) assumes it. See "Performance" for what one instance does on one core.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.

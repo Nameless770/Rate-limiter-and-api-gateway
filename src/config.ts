@@ -203,6 +203,34 @@ const jwtIssuerSchema = z
     }
   });
 
+const websocketSchema = z.strictObject({
+  /**
+   * Origins (scheme://host[:port]) whose pages may open a WebSocket here. A browser always sends Origin and a page
+   * cannot forge it, so this is the defence against cross-site WebSocket hijacking: any website can ask the
+   * browser to open a socket to your host with your users' cookies attached. Clients that send no Origin (scripts,
+   * native apps) are not browsers and are not affected by this list. Empty means no browser may connect.
+   */
+  allowedOrigins: z
+    .array(
+      z
+        .string()
+        .regex(
+          /^https?:\/\/[^/\s?#]+$/i,
+          'must be an origin such as https://app.example.com (scheme and host, no path)',
+        )
+        .transform((origin) => origin.toLowerCase()),
+    )
+    .default([]),
+  /** Accept any Origin. Only safe if the socket does not authenticate with cookies. */
+  allowAnyOrigin: z.boolean().default(false),
+  /** Close a connection with no traffic in either direction for this long. Ping/pong keeps one alive. */
+  idleTimeoutMs: positiveInt.default(60_000),
+  /** Close a connection after this long regardless of activity. Unset means no limit. */
+  maxDurationMs: positiveInt.optional(),
+  /** Most simultaneous WebSockets on this route. */
+  maxConnections: positiveInt.default(1_000),
+});
+
 const routeAuthSchema = z.strictObject({
   /** How a caller may prove who they are on this route. */
   methods: z.array(z.enum(['api-key', 'jwt'])).min(1),
@@ -232,6 +260,12 @@ const routeSchema = z.strictObject({
    * budget can still make one such request per refill.
    */
   cost: positiveInt.default(1),
+  /**
+   * Proxy WebSocket upgrades on this route. Without it an Upgrade request gets a 404: the upgrade mechanism also
+   * carries other protocols, so it is opt-in per route. Authentication and rate limits apply to opening the
+   * connection; the gateway does not look inside the frames that follow.
+   */
+  websocket: websocketSchema.optional(),
   /** Authenticate callers on this route. Without it the gateway checks no credentials (it only rate limits). */
   auth: routeAuthSchema.optional(),
 });
@@ -476,6 +510,28 @@ export const configSchema = z
           code: 'custom',
           path: ['routes', i, 'cost'],
           message: `cost ${route.cost} exceeds the route's whole allowance of ${allowance}, so no request could ever succeed`,
+        });
+      }
+    });
+
+    cfg.routes.forEach((route, i) => {
+      const ws = route.websocket;
+      if (!ws) return;
+      if (route.cache) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'websocket'],
+          message: 'a websocket route cannot also be cached',
+        });
+      }
+      if (route.methods && !route.methods.includes('GET')) {
+        ctx.addIssue({ code: 'custom', path: ['routes', i, 'methods'], message: 'a websocket route must allow GET' });
+      }
+      if (ws.allowAnyOrigin && ws.allowedOrigins.length > 0) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'websocket'],
+          message: 'allowAnyOrigin makes allowedOrigins meaningless: set one or the other',
         });
       }
     });

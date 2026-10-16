@@ -53,6 +53,26 @@ export function securityNotes(config: GatewayConfig): string[] {
     }
   }
 
+  for (const route of config.routes) {
+    const ws = route.websocket;
+    if (!ws) continue;
+    const id = route.id ?? route.path;
+    if (ws.allowAnyOrigin) {
+      notes.push(
+        `websocket route "${id}" accepts any Origin. If it authenticates with cookies, any website can open a ` +
+          'socket as your logged-in users (cross-site WebSocket hijacking). List allowedOrigins instead.',
+      );
+    } else if (ws.allowedOrigins.length === 0) {
+      notes.push(
+        `websocket route "${id}" lists no allowedOrigins, so browsers cannot connect (only clients that send no ` +
+          'Origin header, such as scripts and native apps). Set allowedOrigins to let your web app in.',
+      );
+    }
+    if (!route.auth) {
+      notes.push(`websocket route "${id}" has no auth: anyone who can reach it can open a connection.`);
+    }
+  }
+
   for (const issuer of config.auth.jwt?.issuers ?? []) {
     if (issuer.audience === undefined) {
       notes.push(

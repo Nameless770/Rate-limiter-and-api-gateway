@@ -1,5 +1,6 @@
 import http, { type IncomingHttpHeaders, type IncomingMessage } from 'node:http';
 import https from 'node:https';
+import type { Duplex } from 'node:stream';
 
 /**
  * Why an upstream call failed, which decides whether retrying it is safe:
@@ -8,8 +9,9 @@ import https from 'node:https';
  *  reset    the connection dropped mid-flight: same caveat as timeout
  *  tls      the TLS handshake or certificate check failed: deterministic, so retrying is pointless
  *  aborted  our own side gave up (the client went away): says nothing about upstream health
+ *  protocol the upstream answered, but not the way the protocol requires (a bad WebSocket handshake): deterministic
  */
-export type UpstreamErrorKind = 'connect' | 'timeout' | 'reset' | 'tls' | 'aborted';
+export type UpstreamErrorKind = 'connect' | 'timeout' | 'reset' | 'tls' | 'aborted' | 'protocol';
 
 export class UpstreamError extends Error {
   constructor(
@@ -32,6 +34,11 @@ export interface UpstreamRequest {
   /** Overrides the client's default per-attempt timeout (used to respect an overall deadline). */
   timeoutMs?: number;
 }
+
+/** What an upgrade request came back as: a switched protocol (101), or an ordinary refusal to relay as-is. */
+export type UpgradeOutcome =
+  | { kind: 'upgraded'; headers: IncomingHttpHeaders; socket: Duplex; head: Buffer }
+  | { kind: 'rejected'; response: UpstreamResponse };
 
 export interface UpstreamResponse {
   status: number;
@@ -87,6 +94,25 @@ export class UpstreamClient {
   }
 
   request(req: UpstreamRequest): Promise<UpstreamResponse> {
+    return this.exchange(req, false).then((outcome) => {
+      if (outcome.kind === 'rejected') return outcome.response;
+      // Unreachable: we only ask Node to surface 'upgrade' when the caller asked for an upgrade.
+      outcome.socket.destroy();
+      throw new UpstreamError('reset', 'unexpected protocol switch');
+    });
+  }
+
+  /**
+   * Send a WebSocket-style upgrade request. Resolves with the raw socket once the upstream answers 101, with the
+   * bytes it already sent after its headers. If the upstream answers with anything else, that response is handed
+   * back to be relayed. The per-attempt timeout covers connecting and the handshake only: once upgraded, how long
+   * the connection may live or idle is the caller's business.
+   */
+  upgrade(req: Omit<UpstreamRequest, 'method' | 'body'>): Promise<UpgradeOutcome> {
+    return this.exchange({ ...req, method: 'GET' }, true);
+  }
+
+  private exchange(req: UpstreamRequest, allowUpgrade: boolean): Promise<UpgradeOutcome> {
     return new Promise((resolve, reject) => {
       if (req.signal?.aborted) return reject(new UpstreamError('aborted', 'client went away'));
 
@@ -105,7 +131,7 @@ export class UpstreamClient {
         (res) => {
           clearTimeout(headerTimer);
           req.signal?.removeEventListener('abort', onAbort);
-          resolve({ status: res.statusCode ?? 502, headers: res.headers, stream: res });
+          resolve({ kind: 'rejected', response: { status: res.statusCode ?? 502, headers: res.headers, stream: res } });
         },
       );
 
@@ -122,6 +148,16 @@ export class UpstreamClient {
         outgoing.destroy(new UpstreamError('aborted', 'client went away'));
       };
       req.signal?.addEventListener('abort', onAbort, { once: true });
+
+      if (allowUpgrade) {
+        outgoing.on('upgrade', (res, socket, head) => {
+          clearTimeout(headerTimer);
+          req.signal?.removeEventListener('abort', onAbort);
+          socket.setTimeout(0); // the request-level idle timeout must not outlive the handshake
+          socket.on('error', () => {}); // the tunnel attaches its own handler; until then an error must not be fatal
+          resolve({ kind: 'upgraded', headers: res.headers, socket, head });
+        });
+      }
 
       outgoing.on('error', (error) => {
         clearTimeout(headerTimer);
