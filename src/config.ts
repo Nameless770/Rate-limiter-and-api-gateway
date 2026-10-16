@@ -394,6 +394,17 @@ export const configSchema = z
       })
       .prefault({}),
 
+    /**
+     * Run several worker processes, one per core, behind the same port. 1 (the default) keeps everything in this
+     * process. Rate limits are shared between workers through Redis, which is why more than one worker requires
+     * it; everything else (cache, circuit breakers, health checks, connection and memory limits) is per worker.
+     */
+    cluster: z
+      .strictObject({
+        workers: z.union([z.literal('auto'), z.number().int().min(1).max(256)]).default(1),
+      })
+      .prefault({}),
+
     cache: z
       .strictObject({
         maxEntries: positiveInt.default(1_000),
@@ -445,6 +456,16 @@ export const configSchema = z
     routes: z.array(routeSchema).min(1),
   })
   .superRefine((cfg, ctx) => {
+    if (cfg.cluster.workers !== 1 && !cfg.redis) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['cluster', 'workers'],
+        message:
+          'more than one worker requires a redis section: in-memory rate limits are per process, so each worker would ' +
+          'grant a client the full limit and N workers would allow N times it',
+      });
+    }
+
     const seenRoutes = new Set<string>();
     cfg.routes.forEach((route, i) => {
       if (!(route.upstream in cfg.upstreams)) {
@@ -651,6 +672,12 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
   if (raw && typeof raw === 'object') {
     const obj = raw as Record<string, unknown>;
     if (env['PORT']) obj['port'] = Number(env['PORT']);
+    if (env['WORKERS']) {
+      obj['cluster'] = {
+        ...(obj['cluster'] as object | undefined),
+        workers: env['WORKERS'] === 'auto' ? 'auto' : Number(env['WORKERS']),
+      };
+    }
     if (env['REDIS_URL']) {
       obj['redis'] = { ...(obj['redis'] as object | undefined), url: env['REDIS_URL'] };
     }

@@ -52,16 +52,18 @@ async function setup(
     route?: Record<string, unknown>;
     gateway?: Record<string, unknown>;
     upstream?: Record<string, unknown>;
-    urls?: (up: WsUpstream) => string[];
+    /** Target URLs; `dead` is one nothing is listening on (picked after the upstream is up, so it cannot be reused). */
+    urls?: (up: WsUpstream, dead: string) => string[];
   } = {},
 ): Promise<Setup> {
   const up = await startWsUpstream(options.up);
   cleanups.push(up.close);
   const { logger, lines } = capturingLogger();
+  const dead = options.urls ? `http://127.0.0.1:${await closedPort()}` : '';
   const g = await startGateway(
     {
       upstreams: {
-        u: options.urls ? { urls: options.urls(up), ...options.upstream } : { url: up.url, ...options.upstream },
+        u: options.urls ? { urls: options.urls(up, dead), ...options.upstream } : { url: up.url, ...options.upstream },
       },
       routes: [
         {
@@ -563,18 +565,20 @@ describe('the upstream side of the handshake', () => {
   });
 
   it('moves on to another target when one cannot be reached', async () => {
-    const dead = await closedPort();
-    const t = await setup({ urls: (up) => [`http://127.0.0.1:${dead}`, up.url] });
+    const t = await setup({ urls: (up, dead) => [dead, up.url] });
     expect((await t.connect()).closed).toBe(false);
     expect(t.up.hits).toHaveLength(1);
   });
 
   it('answers 502, without detail, when no target can be reached, and counts the failures against the breaker', async () => {
-    const dead = await closedPort();
-    const t = await setup({ urls: () => [`http://127.0.0.1:${dead}`], upstream: { retry: { maxAttempts: 2 } } });
+    let dead = '';
+    const t = await setup({
+      urls: (_up, deadUrl) => [(dead = deadUrl)],
+      upstream: { retry: { maxAttempts: 2 } },
+    });
     const res = await t.open();
     expect(res.status).toBe(502);
-    expect(res.body).not.toContain(String(dead));
+    expect(res.body).not.toContain(new URL(dead).port);
     expect(t.g.gateway.circuit('u')?.snapshot().failures).toBe(2);
   });
 

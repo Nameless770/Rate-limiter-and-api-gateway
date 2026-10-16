@@ -320,6 +320,33 @@ Browsers cannot set `Authorization` or `X-API-Key` on a `new WebSocket(...)`, so
 
 Observability: the handshake is one access-log line with status `101`; when the connection ends, a `websocket closed` line has the reason (`client`, `upstream`, `idle`, `max_duration`, `shutdown`, `error`), lifetime and bytes each way. Metrics: `gateway_websocket_connections`, `gateway_websocket_closed_total{reason}` and `gateway_websocket_bytes_total{direction}`.
 
+## Scaling across cores
+
+One gateway process runs the request path on one thread. To use every core of a machine, turn on cluster mode:
+
+```json
+"cluster": { "workers": 4 }     // or "auto" for one per core; WORKERS=4 in the environment overrides the file
+```
+
+The entrypoint then becomes a **primary** that runs no gateway of its own and starts that many **workers**, each a complete gateway sharing the same port (`node:cluster`; on Linux the primary hands each new connection to the next worker in turn, and a keep-alive connection stays with the worker it landed on).
+
+- **It requires Redis.** In-memory limits are per process, so N workers would each give a client the full limit and allow N times it. A config with more than one worker and no `redis` section is rejected at startup. With Redis the limit holds across workers: the integration test sends 20 requests on fresh connections through 3 workers against a limit of 5 and sees exactly 5 admitted.
+- **Workers are kept alive.** A worker that dies is replaced after 0.5 s, and the wait doubles (up to 30 s) while it keeps dying young, so a crash loop cannot spin the machine. If a worker cannot start at all (three attempts), start-up is abandoned and the process exits 1 where a deploy will see it. Workers also exit if the primary goes away.
+- **The admin listener lives in the primary and speaks for all workers.** `/_gateway/metrics` has every worker's series under a `worker` label (counters are not pre-summed; use `sum without (worker) (...)`) plus the primary's own (`worker="primary"`: `gateway_cluster_workers`, `gateway_cluster_worker_ready{slot}`, `gateway_cluster_worker_restarts_total{slot}` and its process metrics). `/_gateway/health` has a `cluster` summary and each worker's full report, and says `degraded` if one does not answer. `/_gateway/live` is 200 while at least one worker is ready. The token applies as before. Log lines from workers carry a `worker` field.
+- **Some state is per worker, and should be sized for one worker:** the response cache (so N copies, and a lower hit rate), circuit breakers and active health checks (each worker probes each target), and the `limits` (connections, in-flight requests, buffered bytes) and WebSocket `maxConnections`.
+- **Shutdown and reloads.** `SIGTERM`/`SIGINT` to the primary has every worker finish its in-flight requests (up to `shutdownGraceMs`), and it exits 0 once they are gone. `SIGHUP` reloads the TLS certificate in every worker (POSIX; each validates before swapping, as in "TLS").
+
+Measured on the machine described under "Performance" (Linux container, Redis limiter, 128 connections, median of 3):
+
+| Workers | req/s | vs one | p50 / p99 ms |
+|---:|---:|---:|---:|
+| 1 (no cluster) | 5,665 | 1.0x | 21.5 / 34.6 |
+| 2 | 10,073 | 1.8x | 11.7 / 22.4 |
+| 4 | 14,709 | 2.6x | 8.1 / 18.9 |
+| 8 | 15,593 | 2.8x | 7.3 / 22.4 |
+
+Scaling is near-linear to two workers, then limited by the machine rather than the design: the load generator (6 threads), the upstream, Redis and the gateway share 16 hardware threads (8 cores), so the gateway's CPU per request climbs from 219 µs to 569 µs at 8 workers as they contend with everything else, and throughput stops following. On a machine where the load comes from elsewhere, expect to get closer to one core's worth per worker until Redis (one thread) becomes the limit.
+
 ## Behaviour at the edges
 
 | Situation | What happens |
@@ -342,6 +369,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | root | `allowedMethods` | `GET HEAD POST PUT PATCH DELETE OPTIONS` | Anything else gets 405 |
 | root | `forwardedHost` | unset | The `X-Forwarded-Host` sent upstream when the gateway is the edge |
 | `admin` | `enabled`, `host`, `port`, `token` | `true`, `127.0.0.1`, `9090`, unset | Health/metrics listener. A non-loopback `host` requires a `token` (16+ chars) |
+| `cluster` | `workers` | `1` | Worker processes (a number, or `"auto"` for one per core; `WORKERS` overrides). More than one requires `redis`; see "Scaling across cores" |
 | `tls` | `certFile`, `keyFile`, `passphrase`, `minVersion`, `hstsMaxAgeSeconds` | off; `TLSv1.2`; unset | Terminate TLS on the proxy listener (see "TLS") |
 | `redis` | `url`, `keyPrefix`, `commandTimeoutMs`, `caFile` | `-`, `gw:`, `100`, unset | Omit the section for in-memory limiting. `rediss://` for TLS; `caFile` for a private CA |
 | `rateLimit` | `identityHeader` | `x-api-key` | Header carrying the API key |
@@ -375,6 +403,7 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
   - TLS handshake failures by cause and certificate expiry;
   - open WebSockets per route, closes by reason, bytes relayed each way;
+  - in cluster mode, every series per worker under a `worker` label, plus worker readiness and restarts;
   - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
@@ -403,7 +432,7 @@ Latency of a single request with no queueing (1 connection, Linux): direct **0.1
 
 What the numbers say:
 
-- **One gateway process is one core.** It saturates at roughly 6,000 proxied requests per second on this machine (Linux). That is about two thirds of what a bare Node proxy manages here (9,200/s). In single-thread time that is roughly 160 µs per request against 108 µs: routing, identity, limiting, metrics, retry and breaker bookkeeping and body buffering cost about 50 µs on top of Node's own HTTP floor, most of which is socket writes and parsing that any proxy pays. To go faster, run more instances; the limiter state is in Redis precisely so that works.
+- **One gateway process is one core.** It saturates at roughly 6,000 proxied requests per second on this machine (Linux). That is about two thirds of what a bare Node proxy manages here (9,200/s). In single-thread time that is roughly 160 µs per request against 108 µs: routing, identity, limiting, metrics, retry and breaker bookkeeping and body buffering cost about 50 µs on top of Node's own HTTP floor, most of which is socket writes and parsing that any proxy pays. To go faster, use cluster mode or run more instances; the limiter state is in Redis precisely so that works (measurements under "Scaling across cores").
 - **The limiter is cheap; which algorithm you pick doesn't matter for speed.** In memory it adds about 13 µs of CPU (7%) on Linux, and the three algorithms are indistinguishable at saturation. Redis adds roughly 30–60 µs of gateway CPU for the command and reply handling, and about 0.2 ms to a single request here (Docker over WSL2; a Redis on a real network will differ).
 - **The cost of "no" is small.** A request rejected with 429 never reaches the upstream and costs about a third of a proxied one, so shedding abusive traffic is cheaper than serving it.
 - **Cache hits are the big lever**: about 2.5x the proxied throughput.
@@ -458,8 +487,9 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
   ```
 
 - **Process test** ([`test/process.test.ts`](test/process.test.ts)) starts the real entrypoint and sends it `SIGTERM` mid-request (Linux/macOS).
+- **Cluster tests**: the supervisor (restart and backoff, crash loops, start-up failure, shutdown, the questions it asks workers) runs against fake workers and a fake clock ([`supervisor.test.ts`](test/supervisor.test.ts)), metrics merging and config are unit tests, and [`cluster.integration.test.ts`](test/cluster.integration.test.ts) starts the real entrypoint with several workers against Redis (shared limits, one scrape for all workers, a killed worker replaced, start-up refused when workers cannot start, `SIGTERM` draining on POSIX). Skipped without `REDIS_URL`.
 
-The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones, and for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown), a test fails.
+The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones, for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown, and for the cluster the restart backoff, stale-worker handling, reply validation, start-up give-up and the shared limits), a test fails.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint, the suite against a Redis service container on Node 22 and 24, a production-dependency audit, and a Docker image smoke test. Lint and format are [Biome](https://biomejs.dev) (`npm run lint`, `npm run lint:fix`).
 
@@ -471,6 +501,8 @@ src/
   config.ts               zod schema, env expansion, cross-field validation
   router.ts               longest-prefix routing on path-segment boundaries
   security.ts             startup notes for risky-but-legal settings
+  admin.ts                the admin listener (token, liveness, health, metrics), fed by whoever hosts it
+  cluster/                multi-core mode: supervisor (keeps workers alive), primary, worker side, IPC protocol, metrics merge
   net/ip.ts               address normalization (IPv4-mapped, IPv6 /64)
   auth/jwt.ts             JWT verification (HS256/RS256/ES256) and key loading
   ratelimit/
@@ -498,7 +530,7 @@ demo/                     flaky upstream and load script
 Deliberate scope limits rather than oversights:
 
 - **HTTP/1.1 only.** No HTTP/2 or HTTP/3 (so no WebSockets over HTTP/2 either). WebSockets are proxied as opaque byte tunnels: no per-message limits (see "WebSockets").
-- **One process, one core.** Node runs the request path on a single thread. Scale by running more instances: the design (shared limiter state in Redis) assumes it. See "Performance" for what one instance does on one core.
+- **One core per worker.** Node runs the request path on a single thread. Cluster mode uses every core of one machine ("Scaling across cores"); beyond a machine, run more instances: the shared limiter state in Redis assumes it. See "Performance" for what one core does.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
 - **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation.

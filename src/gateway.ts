@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual, X509Certificate } from 'node:crypto';
+import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http, { type IncomingHttpHeaders, type IncomingMessage, ServerResponse } from 'node:http';
 import https from 'node:https';
@@ -6,6 +6,7 @@ import type { AddressInfo, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { createSecureContext, type TLSSocket } from 'node:tls';
 import type { Redis } from 'ioredis';
+import { AdminListener } from './admin.js';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
 import { requestCacheInfo, requestIsCacheSafe, storeDecision } from './cache/policy.js';
 import { type CachedResponse, ResponseCache } from './cache/responseCache.js';
@@ -18,6 +19,7 @@ import {
   upstreamTargets,
 } from './config.js';
 import { normalizeIp } from './net/ip.js';
+import { listenOn } from './net/listen.js';
 import { createLogger, type Logger } from './observability/logger.js';
 import { Registry } from './observability/metrics.js';
 import { registerProcessMetrics } from './observability/process.js';
@@ -215,7 +217,6 @@ const PROXY_HEADERS = [
 
 export class Gateway {
   readonly server: http.Server | https.Server;
-  readonly adminServer: http.Server;
   readonly metrics = new Registry();
   readonly cache: ResponseCache;
   /** Where the admin listener is bound, once listen() has run (and the admin listener is enabled). */
@@ -236,7 +237,7 @@ export class Gateway {
   private readonly startedAt: number;
   private readonly allowedMethods: Set<string>;
   private readonly maxConnectionsPerIp: number;
-  private readonly adminTokenDigest?: Buffer;
+  private readonly admin: AdminListener;
   private readonly stopProcessMetrics: () => void;
   private closing = false;
   /** Expiry of the certificate currently being served (TLS only). */
@@ -331,9 +332,6 @@ export class Gateway {
       }
     }
     this.maxConnectionsPerIp = config.limits.maxConnectionsPerIp;
-    if (config.admin.token !== undefined) {
-      this.adminTokenDigest = createHash('sha256').update(config.admin.token).digest();
-    }
 
     this.cache = new ResponseCache({ ...config.cache, clock: this.clock });
     this.router = new Router(config.routes);
@@ -424,9 +422,11 @@ export class Gateway {
       void this.handleUpgrade(req, socket, head);
     });
 
-    this.adminServer = http.createServer({ maxHeaderSize: 8 * 1024 }, (req, res) => this.handleAdmin(req, res));
-    this.adminServer.headersTimeout = 5_000;
-    this.adminServer.requestTimeout = 10_000;
+    this.admin = new AdminListener(config.admin, {
+      live: () => ({ status: 200, body: { status: 'ok' } }),
+      health: () => this.healthReport(),
+      metrics: () => this.renderMetrics(),
+    });
   }
 
   /**
@@ -483,7 +483,7 @@ export class Gateway {
     const main = await listenOn(this.server, port, host);
     if (this.config.admin.enabled) {
       try {
-        this.adminAddress = await listenOn(this.adminServer, this.config.admin.port, this.config.admin.host);
+        this.adminAddress = await this.admin.listen();
       } catch (error) {
         this.server.close();
         throw error;
@@ -520,12 +520,7 @@ export class Gateway {
     await closed;
     clearTimeout(force);
 
-    if (this.adminServer.listening) {
-      await new Promise<void>((resolve) => {
-        this.adminServer.close(() => resolve());
-        this.adminServer.closeAllConnections();
-      });
-    }
+    await this.admin.close();
     this.stopProcessMetrics();
 
     for (const { targets, health } of this.upstreams.values()) {
@@ -1796,87 +1791,40 @@ export class Gateway {
     }
   }
 
-  /** Admin listener: liveness is open, everything that exposes internals needs the token when one is set. */
-  private handleAdmin(req: IncomingMessage, res: ServerResponse): void {
-    const answer = this.routeAdmin(req);
-    const text = typeof answer.body === 'string' ? answer.body : JSON.stringify(answer.body);
-    res.writeHead(answer.status, {
-      'content-type': answer.contentType ?? 'application/json; charset=utf-8',
-      'content-length': Buffer.byteLength(text),
-      'x-content-type-options': 'nosniff',
-      'cache-control': 'no-store',
-      ...answer.headers,
-    });
-    res.end(req.method === 'HEAD' ? undefined : text);
+  /** Prometheus text for this process. */
+  renderMetrics(): string {
+    return this.metrics.render();
   }
 
-  private routeAdmin(req: IncomingMessage): {
-    status: number;
-    body: unknown;
-    contentType?: string;
-    headers?: Record<string, string>;
-  } {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      return { status: 405, body: { error: { code: 'method_not_allowed' } }, headers: { allow: 'GET, HEAD' } };
-    }
-    let pathname: string;
-    try {
-      pathname = new URL(req.url ?? '/', 'http://admin.invalid').pathname;
-    } catch {
-      return { status: 400, body: { error: { code: 'bad_request' } } };
-    }
-
-    if (pathname === '/_gateway/live') return { status: 200, body: { status: 'ok' } };
-
-    if (this.adminTokenDigest && !this.adminAuthorized(req)) {
-      return { status: 401, body: { error: { code: 'unauthorized' } }, headers: { 'www-authenticate': 'Bearer' } };
-    }
-
-    if (pathname === '/_gateway/metrics') {
-      return { status: 200, body: this.metrics.render(), contentType: 'text/plain; version=0.0.4; charset=utf-8' };
-    }
-    if (pathname === '/_gateway/health') {
-      const upstreams: Record<string, unknown> = {};
-      for (const u of this.upstreams.values()) {
-        const targets = u.targets.map((t) => ({
-          id: t.id,
-          pending: t.pending,
-          healthy: t.healthy,
-          ...(u.health ? { healthCheck: u.health.checker.snapshot(t.id) } : {}),
-          ...t.breaker.snapshot(),
-        }));
-        const states = new Set(targets.map((t) => t.state));
-        upstreams[u.name] = {
-          // The upstream can serve while any target is closed; it is open only if every target is.
-          state: states.has('closed') ? 'closed' : states.size === 1 && states.has('open') ? 'open' : 'half-open',
-          failures: targets.reduce((sum, t) => sum + t.failures, 0),
-          total: targets.reduce((sum, t) => sum + t.total, 0),
-          targets,
-        };
-      }
-      return {
-        status: 200,
-        body: {
-          status: 'ok',
-          uptimeSeconds: Math.floor((this.clock() - this.startedAt) / 1000),
-          redis: this.redis ? this.redis.status : 'disabled',
-          connections: this.connections,
-          inFlight: this.active.size,
-          upstreams,
-          cache: this.cache.stats(),
-        },
+  /** The state the health endpoint reports: circuit and health-check state per target, load, cache. */
+  healthReport(): Record<string, unknown> {
+    const upstreams: Record<string, unknown> = {};
+    for (const u of this.upstreams.values()) {
+      const targets = u.targets.map((t) => ({
+        id: t.id,
+        pending: t.pending,
+        healthy: t.healthy,
+        ...(u.health ? { healthCheck: u.health.checker.snapshot(t.id) } : {}),
+        ...t.breaker.snapshot(),
+      }));
+      const states = new Set(targets.map((t) => t.state));
+      upstreams[u.name] = {
+        // The upstream can serve while any target is closed; it is open only if every target is.
+        state: states.has('closed') ? 'closed' : states.size === 1 && states.has('open') ? 'open' : 'half-open',
+        failures: targets.reduce((sum, t) => sum + t.failures, 0),
+        total: targets.reduce((sum, t) => sum + t.total, 0),
+        targets,
       };
     }
-    return { status: 404, body: { error: { code: 'route_not_found' } } };
-  }
-
-  private adminAuthorized(req: IncomingMessage): boolean {
-    const match = /^Bearer (.+)$/i.exec(req.headers.authorization ?? '');
-    if (!match || !this.adminTokenDigest) return false;
-    const presented = createHash('sha256')
-      .update(match[1] as string)
-      .digest();
-    return timingSafeEqual(presented, this.adminTokenDigest);
+    return {
+      status: 'ok',
+      uptimeSeconds: Math.floor((this.clock() - this.startedAt) / 1000),
+      redis: this.redis ? this.redis.status : 'disabled',
+      connections: this.connections,
+      inFlight: this.active.size,
+      upstreams,
+      cache: this.cache.stats(),
+    };
   }
 
   private finish(res: ServerResponse, ctx: RequestContext): void {
@@ -1908,16 +1856,6 @@ export class Gateway {
       authFailure: ctx.authFailure,
     });
   }
-}
-
-function listenOn(server: http.Server, port: number, host: string): Promise<AddressInfo> {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, host, () => {
-      server.off('error', reject);
-      resolve(server.address() as AddressInfo);
-    });
-  });
 }
 
 /**

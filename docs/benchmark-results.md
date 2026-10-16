@@ -52,6 +52,22 @@ Raw output of `bench/run.mjs` and `bench/soak.mjs`. Read [Performance in the REA
 | proxy, 64 KiB response | 64 | 2,628 (2,566-2,689) | 23.42 | 42.04 | 48.92 | 49.99 | 461 | 45% |
 | proxy, 16 KiB POST body | 64 | 3,875 (3,821-3,954) | 16.21 | 26.67 | 30.38 | 33.12 | 304 | 45% |
 
+## Cluster scaling
+
+2026-10-16, Node v24.22.0, linux 6.18.33.2-microsoft-standard-WSL2 (container), 16 x 11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz; 128 connections, 10s measured after 3s warm-up, median of 3 runs, Redis 7 in Docker (the benchmark container shares Redis's network namespace). Token bucket limiter in Redis, 1,000 keys, 6 load-generator threads. `node bench/run.mjs --only "cluster x" --repeat 3 --redis redis://127.0.0.1:6379`.
+
+| Scenario | conn | req/s (min-max of 3) | p50 ms | p99 ms | p99.9 ms | max ms | gateway CPU µs/req | gateway CPU (all processes) | upstream CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 worker (no cluster) | 128 | 5,665 (5,581-5,665) | 21.48 | 34.59 | 40.25 | 41.14 | 219 | 113% | 14% |
+| 2 workers | 128 | 10,073 (10,046-10,195) | 11.71 | 22.43 | 31.04 | 40.25 | 247 | 227% | 26% |
+| 4 workers | 128 | 14,709 (14,384-15,201) | 8.10 | 18.86 | 28.46 | 48.92 | 340 | 459% | 48% |
+| 8 workers | 128 | 15,593 (14,501-16,337) | 7.27 | 22.43 | 32.42 | 44.86 | 569 | 815% | 77% |
+
+- Zero errors and zero non-2xx/429 responses in every run.
+- Throughput scales 1.8x at two workers and 2.6x at four, then flattens: with the load generator, upstream and Redis sharing the same 16 hardware threads (8 cores), the extra workers only buy CPU contention (gateway CPU per request rises from 219 to 569 µs) and the 8-worker run is not meaningfully faster than 4. This is a property of the test machine, not a measure of the design's ceiling.
+- Metrics for these runs were read from the primary's aggregated `/_gateway/metrics`, with the per-worker series added together.
+- Harness fix made while taking these: `bench/harness.mjs` now waits for a gateway process to exit before the next scenario reuses its ports. Before that, a still-draining process could answer the next gateway's readiness check and then hang up on it (seen once, as a `socket hang up` in the first cluster run).
+
 ## Soak runs
 
 Traffic: three concurrent streams, 48 connections in total. `/api` is rate limited per key drawn from 200,000 distinct values; `/cached` is a GET with one of 5,000 ids and a 3 s TTL; `/flaky` has an upstream that fails 2% of requests (3 attempts). Sampled from the gateway's own `/_gateway/metrics` every 5 s. Linux container on WSL2, same machine as above.

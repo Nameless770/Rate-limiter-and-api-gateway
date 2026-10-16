@@ -69,6 +69,16 @@ const scenarios = [
         },
       ]
     : []),
+  // One gateway process per core: the same Redis-backed scenario with more workers behind the same port.
+  ...(redis
+    ? [1, 2, 4, 8].map((n) => ({
+        name: `cluster x${n} + token bucket (Redis)`,
+        gateway: { ...redis, rateLimit: { default: tb }, ...(n > 1 ? { cluster: { workers: n } } : {}) },
+        keys: 1000,
+        connections: 128,
+        loadWorkers: 6,
+      }))
+    : []),
   { name: 'proxy + cache hit', gateway: {}, cached: true, path: '/cached' },
   {
     name: 'proxy, every request rate limited (429)',
@@ -108,7 +118,7 @@ async function runOnce(s) {
     duration: s.duration ?? duration,
     warmup,
     connections: c,
-    workers: c === 1 ? 1 : 4,
+    workers: s.loadWorkers ?? (c === 1 ? 1 : 4),
     keys: s.keys ?? 0,
     method: s.method ?? 'GET',
     bodyBytes: s.bodyBytes ?? 0,

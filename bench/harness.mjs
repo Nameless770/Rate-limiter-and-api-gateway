@@ -98,19 +98,31 @@ export async function startBenchGateway(config, { logLevel = 'warn' } = {}) {
     metrics: async () => parseMetrics((await httpGet(`${adminBase}/_gateway/metrics`)).body),
     health: async () => JSON.parse((await httpGet(`${adminBase}/_gateway/health`)).body),
     stop: async () => {
-      child.kill();
+      // Wait for it to be gone: the next scenario reuses these ports, and a gateway that is still draining would
+      // answer its readiness check and then hang up on it.
+      const gone = new Promise((resolveExit) => child.once('exit', resolveExit));
+      if (child.exitCode === null) child.kill();
+      await Promise.race([gone, sleep(15_000)]);
+      if (child.exitCode === null) child.kill('SIGKILL');
       rmSync(dir, { recursive: true, force: true });
     },
   };
 }
 
-/** Prometheus text to a flat map keyed by the metric line up to the value, e.g. `name{a="b"}`. */
+/**
+ * Prometheus text to a flat map keyed by the metric line up to the value, e.g. `name{a="b"}`. A cluster's scrape has
+ * one series per worker (a `worker` label); those are added together, so the numbers describe the whole gateway.
+ */
 export function parseMetrics(text) {
   const out = {};
   for (const line of text.split('\n')) {
     if (!line || line.startsWith('#')) continue;
     const i = line.lastIndexOf(' ');
-    out[line.slice(0, i)] = Number(line.slice(i + 1));
+    const key = line
+      .slice(0, i)
+      .replace(/\{worker="[^"]*",/, '{')
+      .replace(/\{worker="[^"]*"\}/, '');
+    out[key] = (out[key] ?? 0) + Number(line.slice(i + 1));
   }
   return out;
 }
