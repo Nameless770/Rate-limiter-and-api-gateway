@@ -4,6 +4,7 @@ A small API gateway that sits in front of other HTTP services and handles the cr
 
 - **Per-key rate limiting** with a token bucket, an exact sliding window or an approximate (O(1)-memory) sliding-window counter, implemented from scratch and backed by Redis so the limit is shared by every gateway instance
 - **API keys with plans**, per-key overrides, and a per-address ceiling so rotating key values doesn't buy a fresh budget
+- **Authentication per route**: registered API keys and signed JWTs (HS256 / RS256 / ES256), verified by the gateway, with a trusted identity passed to the upstream
 - **Routing** by path prefix, with prefix stripping and per-route policy
 - **Response caching** with HTTP-correct freshness rules, stampede protection and a defence against cache poisoning
 - **Load balancing** across several targets per upstream, each with its own circuit breaker
@@ -187,12 +188,59 @@ CLOSED ── failure rate >= threshold (with minimumRequests) ──▶ OPEN �
 
 Outcomes are counted over a rolling window. While every target of an upstream is open, requests get an immediate 503 with `Retry-After` and put zero load on it. Results from calls admitted before a state change are ignored, so a slow request started while closed can't be mistaken for a probe. A client hanging up is not counted as an upstream failure.
 
+## Authentication
+
+By default the gateway checks no credentials: an API key only picks a rate-limit budget. A route opts in to real authentication with `auth`:
+
+```jsonc
+"auth": {
+  "jwt": { "issuers": [
+    { "name": "partner", "alg": "RS256", "publicKeyFile": "/etc/gateway/partner.pem",
+      "issuer": "https://idp.example.com", "audience": "orders-api", "maxLifetimeSeconds": 3600, "plan": "pro" },
+    { "name": "internal", "alg": "HS256", "secret": "${INTERNAL_JWT_SECRET}", "audience": "orders-api" }
+  ] },
+  "forwardIdentity": true,      // tell the upstream who the caller is (X-Authenticated-*)
+  "forwardCredentials": false   // ...and don't hand it the token/key it doesn't need
+},
+"routes": [
+  { "path": "/orders", "upstream": "orders", "auth": { "methods": ["jwt", "api-key"] } },
+  { "path": "/catalog", "upstream": "catalog", "auth": { "methods": ["jwt"], "required": false } }
+]
+```
+
+- **Methods.** `api-key` needs a key from the registry (`rateLimit.apiKeys`); `jwt` needs a bearer token from a configured issuer. With `required: true` (the default) a request with neither gets a 401 and a `WWW-Authenticate` challenge; with `required: false` anonymous callers pass, but **a credential that is presented and wrong is always refused**, so an expired token never silently becomes "logged out" and a client can't probe tokens for free.
+- **The authenticated identity is what gets rate limited.** A JWT subject has one budget however many tokens it mints, an issuer's `plan` scales it, and the same subject at two issuers is two identities. Failed attempts count against the per-address ceiling, which is checked *before* any credential is examined, so guessing keys or tokens is throttled at the price of one counter update.
+- **The upstream is told who the caller is** in `X-Authenticated-Client`, `X-Authenticated-Method` and (for JWTs) `X-Authenticated-Issuer`. These headers are **always stripped from incoming requests**, on every route, and set only from a credential the gateway verified itself, so an upstream can trust them. Subjects are free text, so anything outside printable ASCII is percent-encoded rather than allowed to split the header block.
+- **`forwardCredentials: false`** withholds only the credential the gateway consumed. Other schemes in `Authorization` (Basic, an opaque token meant for the upstream) pass through untouched, and routes without `auth` never have credentials touched.
+- **Caching** an authenticated route keeps one entry per credential, and the token is verified on every request, hit or miss: an expired token gets nothing from the cache.
+
+### How JWTs are verified
+
+Every classic JWT vulnerability is a case of letting the *token* decide how it is checked, so none of those decisions are left to it:
+
+| Attack | Why it fails |
+|---|---|
+| `alg: none` (any capitalisation, with or without a signature) | The algorithm is taken from configuration. A token's `alg` is only *compared* against it, and `none` is not an algorithm any key is configured for |
+| RS256 public key used as an HMAC secret | A token claiming HS256 is never checked against an RS256 key; the algorithm must match the one the key was provisioned for |
+| Signature stripped, truncated, or from another key | Verified (HMAC with a constant-time compare, RSA, or ECDSA over the raw R\|\|S encoding a JWS requires) before any claim is read |
+| Tampered claims | The signature covers them |
+| Replayed after expiry; not-yet-valid; wrong audience or issuer | `exp` is mandatory and must be a number (not the string `"9999999999"`), `nbf`/`iat` are checked, `audience` and `issuer` are matched exactly, and `maxLifetimeSeconds` caps how long a stolen token stays useful |
+| Duplicate member names (`{"sub":"a","sub":"admin"}`), which different parsers read differently | Rejected. The upstream may receive the very same token and parse it differently |
+| `crit` extensions, `b64: false` | Rejected: we implement none, and RFC 7515 says to refuse what you don't understand |
+| Weak keys | HMAC secrets under 32 bytes, RSA under 2048 bits and EC other than P-256 are refused **at startup**, naming the issuer |
+| Oversized tokens | Rejected at 8 KB before any parsing or cryptography |
+
+Keys are static configuration. To rotate, list the old and new key as two entries (with distinct `kid`s, or the same `issuer`) and remove the old one later. There is deliberately **no JWKS fetching**: it adds an outbound request, a cache with its own staleness rules, and an SSRF surface. Failure reasons (`expired`, `bad_signature`, ...) go to the log, keyed by request id, and never to the client; tokens are never logged.
+
 ## Security model
 
 What the gateway defends, and how. Everything here has a test; the table points at them.
 
 | Threat | Defence | Test |
 |---|---|---|
+| Forged identity headers (`X-Authenticated-*`) | Stripped from every incoming request; set only from a credential the gateway verified | `gateway.auth.test.ts` |
+| Forged, replayed or confused JWTs | Algorithm and key come from configuration, strict claim checks, duplicate-member and `crit` rejection, weak keys refused at startup | `jwt.test.ts` |
+| Guessing API keys or tokens | The per-address ceiling is consumed before any credential is examined, failures included | `gateway.auth.test.ts` |
 | Dodging limits by rotating `X-API-Key` | Key registry (digests), unregistered keys share their address's budget, per-address ceiling | `gateway.security.test.ts` |
 | Reaching health/metrics through the proxy | Admin is a separate listener, loopback by default, never proxied (even with a catch-all route); any other bind requires a bearer token (constant-time compare) | `gateway.security.test.ts`, `config.security.test.ts` |
 | Cache poisoning via reflected headers | Header allowlist on cacheable fetches, all keyed; rewrite headers dropped | `gateway.security.test.ts` |
@@ -209,7 +257,7 @@ What the gateway defends, and how. Everything here has a test; the table points 
 
 Startup prints a `security` log line for each risky-but-legal setting (header-keyed limits with no registry or ceiling, plaintext Redis off-box, a cache with no `varyHeaders`, an admin listener bound off loopback).
 
-**Not covered, by design.** This is not an authentication system: an API key identifies a caller *for rate limiting*, it doesn't prove who they are; put real authentication in front of anything sensitive. There is no TLS termination (run behind a load balancer), no WAF/body inspection, and no DDoS protection beyond the caps above: volumetric attacks need to be absorbed upstream of this process.
+**Not covered, by design.** Authentication is credential checking, not an identity provider: there are no sessions, no OAuth flows or token introspection, no JWKS fetching, and no revocation list (keep `maxLifetimeSeconds` short instead). Routes without `auth` check nothing. There is no WAF or body inspection, and no DDoS protection beyond the caps above: volumetric attacks need to be absorbed upstream of this process.
 
 ## Behaviour at the edges
 
@@ -239,6 +287,8 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `rateLimit` | `failureMode` | `local` | `local`, `open` or `closed` |
 | `rateLimit` | `default`, `ip` | none | Default rule for routes; per-address ceiling across routes |
 | `rateLimit` | `apiKeys`, `plans`, `requireKey`, `anonymousMultiplier` | `[]`, `{}`, `false`, `1` | Key registry (see above) |
+| `auth` | `jwt.issuers[]`, `forwardIdentity`, `forwardCredentials` | none, `true`, `true` | Token verification and what the upstream is told. Issuer: `name`, `alg`, `secret` / `publicKey` / `publicKeyFile`, `kid`, `issuer`, `audience`, `leewaySeconds` (30), `maxLifetimeSeconds`, `plan` |
+| `routes[].auth` | `methods`, `required` | none, `true` | `["jwt"]`, `["api-key"]` or both; see "Authentication" |
 | `rateLimit` | `ipv6Prefix` | `64` | IPv6 grouping |
 | `limits` | `maxConnections`, `maxConnectionsPerIp` | `10000`, `0` (off) | Connection caps. The per-address cap is off by default because a load balancer opens every connection from one address; set it when clients connect to the gateway directly |
 | `limits` | `maxInFlight`, `maxBufferedBytes` | `2000`, 64 MiB | Load shedding (503) |
@@ -259,7 +309,7 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 - `GET /_gateway/live`: always open, says only `{"status":"ok"}`. Use it for container/orchestrator probes.
 - `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats (token-gated when one is set)
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
-  - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts;
+  - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
   - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
@@ -359,6 +409,7 @@ src/
   ratelimit/
     algorithms.ts         pure token bucket, sliding window log, sliding window counter
     identity.ts           key registry, plans, overrides, rule scaling
+  auth/jwt.ts             JWT verification (HS256/RS256/ES256) and key loading
     memory.ts             in-process limiters (bounded key space)
     redis.ts              Lua scripts + Redis limiters
     resilient.ts          failure modes + breaker around the store
@@ -384,6 +435,6 @@ Deliberate scope limits rather than oversights:
 - **One process, one core.** Node runs the request path on a single thread. Scale by running more instances: the design (shared limiter state in Redis) assumes it. See "Performance" for what one instance does on one core.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
-- **Not an authentication system** (see "Security model").
+- **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation.
 - **Sliding window log memory is O(limit) per key.** Use `sliding-window-counter` where the limit is large.
 - Request-weighted costs per route, weighted/zone-aware balancing and DNS-based service discovery are natural extensions.

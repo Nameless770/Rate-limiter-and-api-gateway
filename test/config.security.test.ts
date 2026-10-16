@@ -191,6 +191,14 @@ describe('securityNotes', () => {
     );
   });
 
+  it('flags a JWT issuer that does not check the audience', () => {
+    const secret = 'a-test-hmac-secret-of-at-least-32-bytes!!';
+    const withIssuer = (issuer: Record<string, unknown>) =>
+      config({ auth: { jwt: { issuers: [{ name: 'idp', alg: 'HS256', secret, ...issuer }] } } });
+    expect(securityNotes(withIssuer({})).join('\n')).toMatch(/JWT issuer "idp" has no audience/);
+    expect(securityNotes(withIssuer({ audience: 'gateway' })).join('\n')).not.toMatch(/no audience/);
+  });
+
   it('flags a cache with no vary headers', () => {
     const cfg = config({ routes: [{ path: '/pub', id: 'pub', upstream: 'u', cache: { ttlMs: 1, varyHeaders: [] } }] });
     expect(securityNotes(cfg).join('\n')).toMatch(/route "pub" caches with no varyHeaders/);

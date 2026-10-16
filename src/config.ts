@@ -161,6 +161,58 @@ const routeCacheSchema = z.strictObject({
   forwardHeaders: z.array(z.string().toLowerCase()).default(['accept', 'accept-language']),
 });
 
+const jwtIssuerSchema = z
+  .strictObject({
+    /** For logs, metrics and rate-limit identities. */
+    name: z.string().min(1).max(64),
+    /**
+     * The one algorithm this key is for. A token's own `alg` header is only ever compared against it, so a token
+     * cannot choose a different (weaker, or key-confusing) way to be verified.
+     */
+    alg: z.enum(['HS256', 'RS256', 'ES256']),
+    /** HMAC secret for HS256, at least 32 bytes. Use ${ENV_VAR} rather than writing it in the file. */
+    secret: z.string().min(1).optional(),
+    /** PEM public key for RS256 (RSA, 2048 bits or more) or ES256 (P-256). Inline or from a file. */
+    publicKey: z.string().min(1).optional(),
+    publicKeyFile: z.string().min(1).optional(),
+    /** If set, only tokens carrying this `kid` use this key. Several entries with different kids support rotation. */
+    kid: z.string().min(1).max(128).optional(),
+    /** Required `iss` claim. */
+    issuer: z.string().min(1).optional(),
+    /** Value that must appear in `aud`. */
+    audience: z.string().min(1).optional(),
+    /** Clock skew tolerated on exp / nbf / iat. */
+    leewaySeconds: z.number().int().min(0).max(300).default(30),
+    /** Reject tokens valid for longer than this. A cap on how long a stolen token stays useful. */
+    maxLifetimeSeconds: positiveInt.optional(),
+    /** Rate-limit plan (see rateLimit.plans) for every subject of this issuer. */
+    plan: z.string().min(1).optional(),
+  })
+  .superRefine((issuer, ctx) => {
+    if (issuer.alg === 'HS256') {
+      if (!issuer.secret) ctx.addIssue({ code: 'custom', path: ['secret'], message: 'HS256 needs a "secret"' });
+      if (issuer.publicKey || issuer.publicKeyFile) {
+        ctx.addIssue({ code: 'custom', path: ['alg'], message: 'HS256 uses "secret", not a public key' });
+      }
+    } else {
+      if (issuer.secret)
+        ctx.addIssue({ code: 'custom', path: ['secret'], message: `${issuer.alg} uses a public key, not a "secret"` });
+      if ((issuer.publicKey === undefined) === (issuer.publicKeyFile === undefined)) {
+        ctx.addIssue({ code: 'custom', path: [], message: 'set exactly one of "publicKey" and "publicKeyFile"' });
+      }
+    }
+  });
+
+const routeAuthSchema = z.strictObject({
+  /** How a caller may prove who they are on this route. */
+  methods: z.array(z.enum(['api-key', 'jwt'])).min(1),
+  /**
+   * true: a request with no credential is refused (401). false: anonymous callers are allowed, but a credential
+   * that is *presented* and invalid is still refused, so a bad token never silently downgrades to anonymous.
+   */
+  required: z.boolean().default(true),
+});
+
 const routeSchema = z.strictObject({
   /** Used in metrics and rate-limit keys. Defaults to the path. */
   id: z.string().min(1).optional(),
@@ -173,6 +225,8 @@ const routeSchema = z.strictObject({
   /** Omit to inherit the global default; `false` disables limiting for this route. */
   rateLimit: z.union([rateLimitRuleSchema, z.literal(false)]).optional(),
   cache: routeCacheSchema.optional(),
+  /** Authenticate callers on this route. Without it the gateway checks no credentials (it only rate limits). */
+  auth: routeAuthSchema.optional(),
 });
 
 const apiKeySchema = z.strictObject({
@@ -261,6 +315,23 @@ export const configSchema = z
         requireKey: z.boolean().default(false),
         /** Scales the route rule for callers without a registered key, e.g. 0.1 for a tenth of the quota. */
         anonymousMultiplier: z.number().gt(0).max(1).default(1),
+      })
+      .prefault({}),
+
+    auth: z
+      .strictObject({
+        /** Verify `Authorization: Bearer <jwt>` on routes whose auth methods include "jwt". */
+        jwt: z.strictObject({ issuers: z.array(jwtIssuerSchema).min(1).max(32) }).optional(),
+        /**
+         * Tell the upstream who the gateway authenticated, in X-Authenticated-Client and X-Authenticated-Method.
+         * Those headers are always stripped from incoming requests, so an upstream can trust them.
+         */
+        forwardIdentity: z.boolean().default(true),
+        /**
+         * Pass the credential the gateway verified (the API key, or the bearer token) on to the upstream. Set false
+         * when the upstream trusts the identity headers and has no use for the secret.
+         */
+        forwardCredentials: z.boolean().default(true),
       })
       .prefault({}),
 
@@ -370,6 +441,40 @@ export const configSchema = z
             message: `unknown route id "${routeId}"`,
           });
         }
+      }
+    });
+    const issuerNames = new Set<string>();
+    (cfg.auth.jwt?.issuers ?? []).forEach((issuer, i) => {
+      if (issuerNames.has(issuer.name)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['auth', 'jwt', 'issuers', i, 'name'],
+          message: `duplicate issuer name "${issuer.name}"`,
+        });
+      }
+      issuerNames.add(issuer.name);
+      if (issuer.plan !== undefined && !(issuer.plan in rl.plans)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['auth', 'jwt', 'issuers', i, 'plan'],
+          message: `unknown plan "${issuer.plan}" (defined: ${Object.keys(rl.plans).join(', ') || 'none'})`,
+        });
+      }
+    });
+    cfg.routes.forEach((route, i) => {
+      if (route.auth?.methods.includes('jwt') && !cfg.auth.jwt) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'auth', 'methods'],
+          message: 'the "jwt" method needs auth.jwt.issuers to be configured',
+        });
+      }
+      if (route.auth?.methods.includes('api-key') && rl.apiKeys.length === 0) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'auth', 'methods'],
+          message: 'the "api-key" method needs rateLimit.apiKeys to be configured',
+        });
       }
     });
     if (rl.requireKey && rl.apiKeys.length === 0) {

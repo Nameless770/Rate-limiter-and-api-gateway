@@ -53,6 +53,15 @@ export function securityNotes(config: GatewayConfig): string[] {
     }
   }
 
+  for (const issuer of config.auth.jwt?.issuers ?? []) {
+    if (issuer.audience === undefined) {
+      notes.push(
+        `JWT issuer "${issuer.name}" has no audience, so it accepts any token its key signed, including ones minted ` +
+          'for other services. Set audience.',
+      );
+    }
+  }
+
   if (config.admin.enabled && !isLoopbackHost(config.admin.host)) {
     notes.push(
       `the admin listener is bound to ${config.admin.host}:${config.admin.port}. It requires a bearer token, ` +

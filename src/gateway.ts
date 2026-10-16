@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 import type { Redis } from 'ioredis';
+import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
 import { requestCacheInfo, requestIsCacheSafe, storeDecision } from './cache/policy.js';
 import { type CachedResponse, ResponseCache } from './cache/responseCache.js';
 import {
@@ -96,6 +97,10 @@ interface RequestContext {
   upstreamTruncated: boolean;
   /** Request-body bytes this request is holding against the global buffer budget. */
   buffered: number;
+  /** Set when the gateway itself verified the caller (a route with `auth`). Only then is the upstream told who. */
+  auth?: { method: 'api-key' | 'jwt'; client: string; issuer?: string };
+  /** Why authentication failed. A short enumerated code, safe to log; never sent to the client. */
+  authFailure?: string;
 }
 
 interface StoreOptions {
@@ -139,6 +144,18 @@ class ClientAbortedError extends Error {
   constructor() {
     super('client went away');
   }
+}
+
+/** Headers the gateway sets to tell an upstream who it authenticated. Always stripped from incoming requests. */
+const IDENTITY_HEADERS = ['x-authenticated-client', 'x-authenticated-method', 'x-authenticated-issuer'];
+
+/**
+ * A value that is safe in an HTTP header. Subjects come from signed tokens but are still free text: one containing
+ * CR/LF would otherwise split the header block (and Node refuses to send it). Printable ASCII passes through
+ * unchanged; anything else is percent-encoded.
+ */
+function headerSafe(value: string): string {
+  return /^[\x20-\x7E]*$/.test(value) ? value : encodeURIComponent(value);
 }
 
 /** Longest request path written to an access-log line. */
@@ -189,6 +206,9 @@ export class Gateway {
   private readonly limiterCache = new Map<string, RouteLimiter>();
   private readonly ipCeiling?: RouteLimiter;
   private readonly identities: IdentityResolver;
+  private readonly jwt?: JwtVerifier;
+  /** Rate-limit multiplier per JWT issuer name (from the issuer's plan). */
+  private readonly jwtMultiplier = new Map<string, number>();
   private readonly logger: Logger;
   private readonly clock: Clock;
   private readonly redis?: Redis;
@@ -236,6 +256,10 @@ export class Gateway {
     'gateway_unauthorized_total',
     'Requests rejected for lacking a registered API key.',
   );
+  private readonly mAuth = this.metrics.counter(
+    'gateway_auth_total',
+    'Authentication outcomes by route, method and result.',
+  );
   private readonly mLatency = this.metrics.histogram(
     'gateway_request_duration_seconds',
     'End-to-end request latency.',
@@ -252,6 +276,19 @@ export class Gateway {
     this.startedAt = this.clock();
     this.allowedMethods = new Set(config.allowedMethods);
     this.identities = new IdentityResolver(config.rateLimit);
+    if (config.auth.jwt) {
+      const issuers = config.auth.jwt.issuers.map((source) => {
+        try {
+          return loadIssuer(source, (path) => readFileSync(path, 'utf8'));
+        } catch (error) {
+          throw error instanceof JwtKeyError ? new ConfigError(error.message) : error;
+        }
+      });
+      this.jwt = new JwtVerifier(issuers, this.clock);
+      for (const issuer of issuers) {
+        this.jwtMultiplier.set(issuer.name, issuer.plan ? (config.rateLimit.plans[issuer.plan]?.multiplier ?? 1) : 1);
+      }
+    }
     this.maxConnectionsPerIp = config.limits.maxConnectionsPerIp;
     if (config.admin.token !== undefined) {
       this.adminTokenDigest = createHash('sha256').update(config.admin.token).digest();
@@ -668,7 +705,7 @@ export class Gateway {
     if (!match) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
     ctx.route = match.routeId;
 
-    if (!(await this.admitted(req, res, ctx, match.routeId))) return;
+    if (!(await this.admitted(req, res, ctx, match.route, match.routeId))) return;
 
     const body = await this.readBody(req, ctx);
     const upstream = this.upstreams.get(match.route.upstream) as UpstreamRuntime;
@@ -695,28 +732,49 @@ export class Gateway {
     req: IncomingMessage,
     res: ServerResponse,
     ctx: RequestContext,
+    route: RouteConfig,
     routeId: string,
   ): Promise<boolean> {
     const ip = this.clientIp(req);
     const header = req.headers[this.config.rateLimit.identityHeader];
     const presented = Array.isArray(header) ? header[0] : header;
 
-    const resolved = this.identities.resolve(presented || undefined, ip);
-    if (!resolved.ok) {
-      this.mUnauthorized.inc({ route: routeId });
-      this.sendError(res, ctx, 401, 'unauthorized', 'a valid API key is required', { 'www-authenticate': 'ApiKey' });
-      return false;
-    }
-    const { identity } = resolved;
-    ctx.client = identity.name;
-
-    // The address ceiling comes first: it is what bounds a client that rotates credentials, and a flood
-    // should be turned away before it costs more than one counter update.
+    // The address ceiling comes first, before any credential is looked at. It is what bounds a client that rotates
+    // credentials, and it is also the brute-force limit: every request counts against it, including ones that fail
+    // authentication, so a flood of guessed keys or bad tokens (each costing a lookup or a signature check) is
+    // turned away for the price of one counter update.
     let decision: RateLimitDecision | undefined;
     if (this.ipCeiling) {
       decision = await this.ipCeiling.limiter.consume(`rlip:${this.ipCeiling.tag}:${ip}`);
       if (!decision.allowed) return this.reject(res, ctx, routeId, decision);
     }
+
+    let identity: Identity;
+    if (route.auth) {
+      const outcome = this.authenticate(req, route.auth, presented || undefined, ip);
+      this.mAuth.inc({ route: routeId, method: outcome.method, result: outcome.ok ? 'ok' : 'fail' });
+      if (!outcome.ok) {
+        ctx.authFailure = outcome.reason;
+        this.mUnauthorized.inc({ route: routeId });
+        this.sendError(res, ctx, 401, 'unauthorized', 'a valid credential is required', {
+          'www-authenticate': outcome.challenge,
+        });
+        return false;
+      }
+      identity = outcome.identity;
+      if (outcome.authenticated) {
+        ctx.auth = { method: outcome.method as 'api-key' | 'jwt', client: outcome.client, issuer: outcome.issuer };
+      }
+    } else {
+      const resolved = this.identities.resolve(presented || undefined, ip);
+      if (!resolved.ok) {
+        this.mUnauthorized.inc({ route: routeId });
+        this.sendError(res, ctx, 401, 'unauthorized', 'a valid API key is required', { 'www-authenticate': 'ApiKey' });
+        return false;
+      }
+      identity = resolved.identity;
+    }
+    ctx.client = identity.name;
 
     const rule = this.effectiveRule(routeId, identity);
     if (rule) {
@@ -736,6 +794,75 @@ export class Gateway {
     }
     if (decision.allowed) return true;
     return this.reject(res, ctx, routeId, decision);
+  }
+
+  /**
+   * Check the credentials a route asks for.
+   *
+   * A credential that is *presented* and wrong is always refused, even where authentication is optional: letting a
+   * bad token fall through to "anonymous" would make a typo or an expired token silently look like a logged-out
+   * user, and would let a client probe tokens without consequence. Only the *absence* of a credential is allowed
+   * to mean anonymous, and only where `required` is false.
+   */
+  private authenticate(
+    req: IncomingMessage,
+    auth: NonNullable<RouteConfig['auth']>,
+    presentedKey: string | undefined,
+    ip: string,
+  ):
+    | { ok: true; identity: Identity; method: string; authenticated: boolean; client: string; issuer?: string }
+    | { ok: false; method: string; reason: string; challenge: string } {
+    const wantsJwt = auth.methods.includes('jwt');
+    const wantsKey = auth.methods.includes('api-key');
+    const challenge = (invalidToken: boolean): string =>
+      [
+        wantsJwt ? (invalidToken ? 'Bearer error="invalid_token"' : 'Bearer') : undefined,
+        wantsKey ? 'ApiKey' : undefined,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
+    if (wantsJwt && this.jwt) {
+      const token = bearerToken(req.headers.authorization);
+      if (token !== undefined) {
+        const result = this.jwt.verify(token);
+        if (!result.ok) return { ok: false, method: 'jwt', reason: result.reason, challenge: challenge(true) };
+        return {
+          ok: true,
+          method: 'jwt',
+          authenticated: true,
+          client: result.subject,
+          issuer: result.issuer.name,
+          identity: this.jwtIdentity(result.issuer, result.subject),
+        };
+      }
+    }
+
+    if (wantsKey && presentedKey !== undefined) {
+      const identity = this.identities.lookupRegistered(presentedKey);
+      if (!identity) return { ok: false, method: 'api-key', reason: 'unknown_api_key', challenge: challenge(false) };
+      return { ok: true, method: 'api-key', authenticated: true, client: identity.name ?? '', identity };
+    }
+
+    if (auth.required) return { ok: false, method: 'none', reason: 'missing_credentials', challenge: challenge(false) };
+
+    // Optional authentication and nothing presented: an ordinary anonymous caller, limited like any other.
+    const anonymous = this.identities.resolve(presentedKey, ip);
+    const identity: Identity = anonymous.ok
+      ? anonymous.identity
+      : { id: `ip:${ip}`, kind: 'anonymous', multiplier: this.config.rateLimit.anonymousMultiplier };
+    return { ok: true, method: 'none', authenticated: false, client: '', identity };
+  }
+
+  private jwtIdentity(issuer: JwtIssuer, subject: string): Identity {
+    const digest = createHash('sha256').update(`${issuer.name}\u0000${subject}`).digest('hex');
+    return {
+      id: `j:${digest.slice(0, 32)}`,
+      kind: 'key',
+      name: `${issuer.name}:${subject}`.slice(0, 128),
+      multiplier: this.jwtMultiplier.get(issuer.name) ?? 1,
+      authMethod: 'jwt',
+    };
   }
 
   private reject(res: ServerResponse, ctx: RequestContext, routeId: string, decision: RateLimitDecision): false {
@@ -1024,6 +1151,22 @@ export class Gateway {
       if (this.config.forwardedHost) headers['x-forwarded-host'] = this.config.forwardedHost;
     }
     headers['x-request-id'] = ctx.requestId;
+
+    // Identity headers are the gateway's word about who the caller is, so a client must never be able to supply
+    // them: strip whatever came in, then set them only from a credential the gateway verified itself.
+    for (const name of IDENTITY_HEADERS) delete headers[name];
+    if (ctx.auth) {
+      if (this.config.auth.forwardIdentity) {
+        headers['x-authenticated-method'] = ctx.auth.method;
+        headers['x-authenticated-client'] = headerSafe(ctx.auth.client);
+        if (ctx.auth.issuer) headers['x-authenticated-issuer'] = headerSafe(ctx.auth.issuer);
+      }
+      if (!this.config.auth.forwardCredentials) {
+        // Only the credential the gateway consumed: other schemes in Authorization are the upstream's business.
+        if (ctx.auth.method === 'jwt') delete headers['authorization'];
+        else delete headers[this.config.rateLimit.identityHeader];
+      }
+    }
 
     // We re-send a fully buffered body, so framing is ours to set.
     delete headers['content-length'];
@@ -1358,6 +1501,7 @@ export class Gateway {
       rateLimited: ctx.rateLimited || undefined,
       degraded: ctx.degraded || undefined,
       truncated: ctx.upstreamTruncated || undefined,
+      authFailure: ctx.authFailure,
     });
   }
 }

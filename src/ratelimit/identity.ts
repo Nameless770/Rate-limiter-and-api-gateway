@@ -12,6 +12,8 @@ export interface Identity {
   multiplier: number;
   /** Per-route replacement rules for this key; `false` means unlimited on that route. */
   overrides?: Record<string, RateLimitRuleConfig | false>;
+  /** How the caller proved who they are, when the gateway checked. */
+  authMethod?: 'api-key' | 'jwt';
 }
 
 export type IdentityResult = { ok: true; identity: Identity } | { ok: false; reason: 'key_required' };
@@ -47,9 +49,15 @@ export class IdentityResolver {
         name: entry.name,
         multiplier: plan?.multiplier ?? 1,
         overrides: entry.overrides,
+        authMethod: 'api-key',
       });
     }
     this.open = this.registry.size === 0;
+  }
+
+  /** The identity of a *registered* key, or undefined for anything else. Never invents one. */
+  lookupRegistered(presentedKey: string): Identity | undefined {
+    return this.registry.get(keyDigest(presentedKey));
   }
 
   resolve(presentedKey: string | undefined, clientIp: string): IdentityResult {
