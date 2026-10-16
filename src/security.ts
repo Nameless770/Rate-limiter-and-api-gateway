@@ -65,7 +65,15 @@ export function securityNotes(config: GatewayConfig): string[] {
   if (config.admin.enabled && !isLoopbackHost(config.admin.host)) {
     notes.push(
       `the admin listener is bound to ${config.admin.host}:${config.admin.port}. It requires a bearer token, ` +
-        'but should still not be reachable from the public internet.',
+        'but it is plain HTTP, so that token crosses the network unencrypted. Keep it on a private network or ' +
+        'reach it through a TLS-terminating proxy.',
+    );
+  }
+
+  if (!config.tls && config.host !== '127.0.0.1' && config.host !== '::1' && config.rateLimit.trustedProxyHops === 0) {
+    notes.push(
+      'the proxy listener is plain HTTP and no trusted proxy is configured, so credentials cross the network ' +
+        'unencrypted. Set tls, or put a TLS-terminating proxy in front and set rateLimit.trustedProxyHops.',
     );
   }
 

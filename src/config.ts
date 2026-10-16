@@ -271,6 +271,24 @@ export const configSchema = z
      */
     forwardedHost: z.string().min(1).optional(),
 
+    /**
+     * Terminate TLS on the proxy listener, so the gateway can face clients directly. Without it the listener is
+     * plain HTTP and is meant to sit behind something that terminates TLS. Send SIGHUP to reload the certificate
+     * without a restart (POSIX), which is how renewals from ACME clients are picked up.
+     */
+    tls: z
+      .strictObject({
+        certFile: z.string().min(1),
+        keyFile: z.string().min(1),
+        /** For an encrypted private key. Use ${ENV_VAR}. */
+        passphrase: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).optional()),
+        /** Oldest protocol version accepted. TLS 1.0 and 1.1 are not offered at all. */
+        minVersion: z.enum(['TLSv1.2', 'TLSv1.3']).default('TLSv1.2'),
+        /** Send `Strict-Transport-Security: max-age=N` on every response. Leave unset until you are sure. */
+        hstsMaxAgeSeconds: z.number().int().min(1).max(63_072_000).optional(),
+      })
+      .optional(),
+
     redis: z
       .strictObject({
         /** `redis://` or `rediss://` (TLS). A password goes in the URL: rediss://:secret@host:6380. */

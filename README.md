@@ -268,6 +268,22 @@ Startup prints a `security` log line for each risky-but-legal setting (header-ke
 
 **Not covered, by design.** Authentication is credential checking, not an identity provider: there are no sessions, no OAuth flows or token introspection, no JWKS fetching, and no revocation list (keep `maxLifetimeSeconds` short instead). Routes without `auth` check nothing. There is no WAF or body inspection, and no DDoS protection beyond the caps above: volumetric attacks need to be absorbed upstream of this process.
 
+## TLS
+
+The proxy listener can terminate TLS itself, so the gateway can face clients directly (otherwise it is plain HTTP, meant to sit behind a load balancer that terminates TLS):
+
+```json
+"tls": { "certFile": "/etc/gateway/tls/fullchain.pem", "keyFile": "/etc/gateway/tls/privkey.pem", "minVersion": "TLSv1.2", "hstsMaxAgeSeconds": 31536000 }
+```
+
+- **TLS 1.2 or 1.3 only.** `minVersion` can raise the floor to 1.3; TLS 1.0 and 1.1 cannot be configured at all.
+- **Renewals without a restart.** `kill -HUP <pid>` (POSIX) re-reads the files and uses the new certificate for new connections; open connections keep the old one until they close. The new pair is validated *before* anything is swapped, so a half-finished renewal (a new certificate with the old key, a truncated file, a missing file) is logged as an error and **the previous certificate stays in service**.
+- **Bad material fails fast at startup**, naming the setting: a missing file, a key that doesn't match the certificate, a wrong or missing passphrase (`passphrase` takes `${ENV_VAR}`). Errors never contain key material.
+- **Handshake timeout.** A client that connects and never completes the TLS handshake is dropped after `limits.headersTimeoutMs`, not Node's default two minutes. Failed handshakes are counted by cause in `gateway_tls_handshake_failures_total`.
+- **Expiry is visible.** `gateway_tls_certificate_expiry_seconds` goes negative when the certificate has lapsed (alert on it); the gateway logs a warning under 14 days and an error once expired, at startup and on every reload.
+- **`X-Forwarded-Proto`** tells the upstream the truth: `https` for clients on this listener. `hstsMaxAgeSeconds` adds `Strict-Transport-Security`; leave it unset until you are certain every client can use HTTPS.
+- The admin listener stays plain HTTP on loopback; its bearer token is not meant to cross a network.
+
 ## Behaviour at the edges
 
 | Situation | What happens |
@@ -290,6 +306,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | root | `allowedMethods` | `GET HEAD POST PUT PATCH DELETE OPTIONS` | Anything else gets 405 |
 | root | `forwardedHost` | unset | The `X-Forwarded-Host` sent upstream when the gateway is the edge |
 | `admin` | `enabled`, `host`, `port`, `token` | `true`, `127.0.0.1`, `9090`, unset | Health/metrics listener. A non-loopback `host` requires a `token` (16+ chars) |
+| `tls` | `certFile`, `keyFile`, `passphrase`, `minVersion`, `hstsMaxAgeSeconds` | off; `TLSv1.2`; unset | Terminate TLS on the proxy listener (see "TLS") |
 | `redis` | `url`, `keyPrefix`, `commandTimeoutMs`, `caFile` | `-`, `gw:`, `100`, unset | Omit the section for in-memory limiting. `rediss://` for TLS; `caFile` for a private CA |
 | `rateLimit` | `identityHeader` | `x-api-key` | Header carrying the API key |
 | `rateLimit` | `trustedProxyHops` | `0` | Take the Nth-from-right `X-Forwarded-For` entry |
@@ -319,6 +336,7 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 - `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats (token-gated when one is set)
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
+  - TLS handshake failures by cause and certificate expiry;
   - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
@@ -440,7 +458,7 @@ demo/                     flaky upstream and load script
 
 Deliberate scope limits rather than oversights:
 
-- **HTTP/1.1 only.** No WebSocket or `Upgrade` proxying, no TLS termination (put a load balancer in front).
+- **HTTP/1.1 only.** No HTTP/2 or HTTP/3, and no WebSocket or `Upgrade` proxying.
 - **One process, one core.** Node runs the request path on a single thread. Scale by running more instances: the design (shared limiter state in Redis) assumes it. See "Performance" for what one instance does on one core.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.

@@ -1,7 +1,9 @@
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http, { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http';
+import https from 'node:https';
 import type { AddressInfo, Socket } from 'node:net';
+import { createSecureContext, type TLSSocket } from 'node:tls';
 import type { Redis } from 'ioredis';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
 import { requestCacheInfo, requestIsCacheSafe, storeDecision } from './cache/policy.js';
@@ -193,7 +195,7 @@ const PROXY_HEADERS = [
 ];
 
 export class Gateway {
-  readonly server: http.Server;
+  readonly server: http.Server | https.Server;
   readonly adminServer: http.Server;
   readonly metrics = new Registry();
   readonly cache: ResponseCache;
@@ -218,6 +220,8 @@ export class Gateway {
   private readonly adminTokenDigest?: Buffer;
   private readonly stopProcessMetrics: () => void;
   private closing = false;
+  /** Expiry of the certificate currently being served (TLS only). */
+  private certNotAfter?: Date;
   /** Responses still in progress, so shutdown can ask them not to keep their connection alive. */
   private readonly active = new Set<ServerResponse>();
   private readonly connectionsByIp = new Map<string, number>();
@@ -236,6 +240,10 @@ export class Gateway {
     'Upstream attempts by target and outcome.',
   );
   private readonly mTransitions = this.metrics.counter('gateway_circuit_transitions_total', 'Circuit state changes.');
+  private readonly mTlsFailures = this.metrics.counter(
+    'gateway_tls_handshake_failures_total',
+    'TLS handshakes that failed, by OpenSSL/Node error code.',
+  );
   private readonly mHealthChecks = this.metrics.counter(
     'gateway_health_checks_total',
     'Active health-check probes by target and result.',
@@ -342,17 +350,38 @@ export class Gateway {
     this.stopProcessMetrics = registerProcessMetrics(this.metrics);
 
     const { limits } = config;
-    this.server = http.createServer(
-      {
-        maxHeaderSize: limits.maxHeaderBytes,
-        // Node only enforces headersTimeout/requestTimeout when it sweeps connections; sweep often enough that
-        // a slow client is cut off close to the configured time rather than up to 30s later.
-        connectionsCheckingInterval: Math.min(1_000, limits.headersTimeoutMs),
-      },
-      (req, res) => {
-        void this.handle(req, res);
-      },
-    );
+    const serverOptions = {
+      maxHeaderSize: limits.maxHeaderBytes,
+      // Node only enforces headersTimeout/requestTimeout when it sweeps connections; sweep often enough that
+      // a slow client is cut off close to the configured time rather than up to 30s later.
+      connectionsCheckingInterval: Math.min(1_000, limits.headersTimeoutMs),
+    };
+    const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
+      void this.handle(req, res);
+    };
+    if (config.tls) {
+      const material = this.readTlsMaterial(config.tls);
+      this.certNotAfter = material.notAfter;
+      this.warnIfExpiring(material.notAfter);
+      this.server = https.createServer(
+        {
+          ...serverOptions,
+          cert: material.cert,
+          key: material.key,
+          passphrase: material.passphrase,
+          minVersion: config.tls.minVersion,
+          // A client that connects and never completes the handshake would otherwise hold a socket for two minutes.
+          handshakeTimeout: limits.headersTimeoutMs,
+        },
+        onRequest,
+      );
+      this.server.on('tlsClientError', (error) => {
+        const code = (error as NodeJS.ErrnoException).code ?? '';
+        this.mTlsFailures.inc({ reason: /^ERR_(SSL|TLS)_/.test(code) ? code : 'other' });
+      });
+    } else {
+      this.server = http.createServer(serverOptions, onRequest);
+    }
     this.server.maxConnections = limits.maxConnections;
     this.server.headersTimeout = limits.headersTimeoutMs;
     this.server.requestTimeout = limits.requestTimeoutMs;
@@ -362,6 +391,56 @@ export class Gateway {
     this.adminServer = http.createServer({ maxHeaderSize: 8 * 1024 }, (req, res) => this.handleAdmin(req, res));
     this.adminServer.headersTimeout = 5_000;
     this.adminServer.requestTimeout = 10_000;
+  }
+
+  /**
+   * Re-read the certificate and key and start using them for new connections. Connections already open keep the
+   * old certificate until they close. If the new material is unreadable or invalid the old certificate stays in
+   * service: a botched renewal must not take the listener down.
+   */
+  reloadTls(): { ok: true; notAfter: Date } | { ok: false; reason: string } {
+    const tlsConfig = this.config.tls;
+    if (!tlsConfig || !(this.server instanceof https.Server)) return { ok: false, reason: 'TLS is not enabled' };
+    try {
+      const material = this.readTlsMaterial(tlsConfig); // validates the pair before anything is swapped
+      this.server.setSecureContext({ cert: material.cert, key: material.key, passphrase: material.passphrase });
+      this.certNotAfter = material.notAfter;
+      this.logger.info('tls certificate reloaded', { notAfter: material.notAfter.toISOString() });
+      this.warnIfExpiring(material.notAfter);
+      return { ok: true, notAfter: material.notAfter };
+    } catch (error) {
+      const reason = (error as Error).message;
+      this.logger.error('tls reload failed; still serving the previous certificate', { reason });
+      return { ok: false, reason };
+    }
+  }
+
+  private readTlsMaterial(tls: NonNullable<GatewayConfig['tls']>): {
+    cert: Buffer;
+    key: Buffer;
+    passphrase?: string;
+    notAfter: Date;
+  } {
+    const cert = readFileOrFail('tls.certFile', tls.certFile);
+    const key = readFileOrFail('tls.keyFile', tls.keyFile);
+    try {
+      // Builds a context from the pair, which fails for a mismatched key, a bad passphrase or garbage PEM.
+      createSecureContext({ cert, key, passphrase: tls.passphrase });
+    } catch (error) {
+      throw new ConfigError(`tls: the certificate and key are not a usable pair: ${(error as Error).message}`);
+    }
+    return { cert, key, passphrase: tls.passphrase, notAfter: new X509Certificate(cert).validToDate };
+  }
+
+  private warnIfExpiring(notAfter: Date): void {
+    const daysLeft = (notAfter.getTime() - this.clock()) / 86_400_000;
+    if (daysLeft <= 0) this.logger.error('tls certificate has expired', { notAfter: notAfter.toISOString() });
+    else if (daysLeft < 14) {
+      this.logger.warn('tls certificate expires soon', {
+        daysLeft: Math.floor(daysLeft),
+        notAfter: notAfter.toISOString(),
+      });
+    }
   }
 
   async listen(port = this.config.port, host = this.config.host): Promise<AddressInfo> {
@@ -599,6 +678,14 @@ export class Gateway {
             u.targets.map((t) => ({ labels: { upstream: u.name, target: t.id }, value: t.healthy ? 1 : 0 })),
           ),
     );
+    this.metrics.gauge(
+      'gateway_tls_certificate_expiry_seconds',
+      'Seconds until the served TLS certificate expires (negative once it has). Only with TLS enabled.',
+      () =>
+        this.certNotAfter
+          ? [{ labels: {}, value: Math.round((this.certNotAfter.getTime() - this.clock()) / 1000) }]
+          : [],
+    );
     this.metrics.gauge('gateway_cache_entries', 'Entries held in the response cache.', () => [
       { labels: {}, value: this.cache.stats().entries },
     ]);
@@ -659,6 +746,9 @@ export class Gateway {
       buffered: 0,
     };
     res.setHeader('x-request-id', requestId);
+    if (this.config.tls?.hstsMaxAgeSeconds) {
+      res.setHeader('strict-transport-security', `max-age=${this.config.tls.hstsMaxAgeSeconds}`);
+    }
     if (this.closing) res.setHeader('connection', 'close');
 
     const shed = this.active.size >= this.config.limits.maxInFlight;
@@ -1150,7 +1240,8 @@ export class Gateway {
     } else {
       for (const name of PROXY_HEADERS) delete headers[name];
       headers['x-forwarded-for'] = remote;
-      headers['x-forwarded-proto'] = 'http'; // this listener is plain HTTP; TLS is terminated in front of it
+      // What this listener actually is. (Behind trusted proxies the proxy's own claim is kept instead.)
+      headers['x-forwarded-proto'] = (req.socket as TLSSocket).encrypted ? 'https' : 'http';
       if (this.config.forwardedHost) headers['x-forwarded-host'] = this.config.forwardedHost;
     }
     headers['x-request-id'] = ctx.requestId;
@@ -1529,6 +1620,14 @@ function waitForDrain(res: ServerResponse): Promise<void> {
     res.once('drain', done);
     res.once('close', done);
   });
+}
+
+function readFileOrFail(setting: string, path: string): Buffer {
+  try {
+    return readFileSync(path);
+  } catch (error) {
+    throw new ConfigError(`${setting}: cannot read "${path}": ${(error as Error).message}`);
+  }
 }
 
 function readCaFile(setting: string, path: string): Buffer {

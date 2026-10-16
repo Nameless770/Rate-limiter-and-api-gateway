@@ -44,6 +44,12 @@ async function main(): Promise<void> {
       process.exit(0);
     }
   };
+  // Certificate renewal: SIGHUP re-reads the files. (Windows has no such signal.)
+  if (config.tls && process.platform !== 'win32') {
+    process.on('SIGHUP', () => {
+      gateway.reloadTls();
+    });
+  }
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }

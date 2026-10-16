@@ -327,3 +327,60 @@ export function rawTcp(
 export function statusLines(data: string): number[] {
   return [...data.matchAll(/HTTP\/1\.[01] (\d{3})/g)].map((m) => Number(m[1]));
 }
+
+export interface TlsResponse {
+  status: number;
+  headers: IncomingHttpHeaders;
+  body: string;
+  /** SHA-256 fingerprint of the certificate the server presented on this connection. */
+  fingerprint: string;
+  /** Negotiated protocol, e.g. TLSv1.3. */
+  protocol: string | null;
+}
+
+/** An HTTPS request that verifies the server against `ca` and reports what was negotiated. */
+export function httpsRequest(
+  base: string,
+  opts: {
+    path: string;
+    ca: Buffer;
+    method?: string;
+    headers?: Record<string, string>;
+    agent?: https.Agent | false;
+    minVersion?: 'TLSv1.2' | 'TLSv1.3';
+    maxVersion?: 'TLSv1.2' | 'TLSv1.3';
+  },
+): Promise<TlsResponse> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname,
+        port,
+        path: opts.path,
+        method: opts.method ?? 'GET',
+        headers: opts.headers,
+        ca: opts.ca,
+        agent: opts.agent ?? false,
+        minVersion: opts.minVersion,
+        maxVersion: opts.maxVersion,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        const socket = res.socket as import('node:tls').TLSSocket;
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString(),
+            fingerprint: socket.getPeerCertificate().fingerprint256,
+            protocol: socket.getProtocol(),
+          }),
+        );
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}

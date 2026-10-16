@@ -199,6 +199,23 @@ describe('securityNotes', () => {
     expect(securityNotes(withIssuer({ audience: 'gateway' })).join('\n')).not.toMatch(/no audience/);
   });
 
+  it('flags a plain-HTTP proxy listener that faces the network with no TLS and no trusted proxy', () => {
+    const plain = (extra: Record<string, unknown>) => securityNotes(config(extra)).join('\n');
+    expect(plain({ host: '0.0.0.0' })).toMatch(/plain HTTP and no trusted proxy/);
+    expect(plain({ host: '0.0.0.0', tls: { certFile: 'c', keyFile: 'k' } })).not.toMatch(
+      /plain HTTP and no trusted proxy/,
+    );
+    expect(plain({ host: '0.0.0.0', rateLimit: { trustedProxyHops: 1 } })).not.toMatch(
+      /plain HTTP and no trusted proxy/,
+    );
+    expect(plain({ host: '127.0.0.1' })).not.toMatch(/plain HTTP and no trusted proxy/);
+  });
+
+  it('says the admin token crosses the network unencrypted when the admin listener is exposed', () => {
+    const notes = securityNotes(config({ admin: { host: '0.0.0.0', token: 'a-sufficiently-long-token' } })).join('\n');
+    expect(notes).toMatch(/plain HTTP, so that token crosses the network unencrypted/);
+  });
+
   it('flags a cache with no vary headers', () => {
     const cfg = config({ routes: [{ path: '/pub', id: 'pub', upstream: 'u', cache: { ttlMs: 1, varyHeaders: [] } }] });
     expect(securityNotes(cfg).join('\n')).toMatch(/route "pub" caches with no varyHeaders/);
