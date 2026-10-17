@@ -91,6 +91,7 @@ describe('AdminListener', () => {
       { host: '127.0.0.1', port: 0, token },
       {
         live: () => ({ status: 200, body: { status: 'ok' } }),
+        ready: () => ({ status: 200, body: { status: 'ready' } }),
         health: () => ({ status: 'ok' }),
         metrics: () => 'm 1\n',
         ...sources,

@@ -149,6 +149,12 @@ describe('redis and limits', () => {
     expect(config({ limits: { maxConnectionsPerIp: 50 } }).limits.maxConnectionsPerIp).toBe(50);
   });
 
+  it('drops a client that stops reading its response after 30 s by default, and takes the limit from config', () => {
+    expect(config({}).limits.responseStallTimeoutMs).toBe(30_000);
+    expect(config({ limits: { responseStallTimeoutMs: 5_000 } }).limits.responseStallTimeoutMs).toBe(5_000);
+    expect(() => config({ limits: { responseStallTimeoutMs: 0 } })).toThrow(/responseStallTimeoutMs/);
+  });
+
   it('upper-cases configured methods', () => {
     expect(config({ allowedMethods: ['get', 'post'] }).allowedMethods).toEqual(['GET', 'POST']);
   });

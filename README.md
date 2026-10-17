@@ -130,6 +130,8 @@ A limiter on the hot path makes "what if the store is unavailable?" a policy dec
 
 Commands are capped at `commandTimeoutMs` (default 100 ms), the client doesn't queue offline commands, and a circuit breaker around the store stops paying that timeout on every request once Redis is clearly unhealthy. Responses made without the store omit `RateLimit-*` headers rather than claim precision they don't have.
 
+At start-up the gateway waits up to 2.5 s for Redis to connect before it accepts traffic, so a freshly started instance (every rolling deploy) counts its first requests in the shared budget rather than in the per-process fallback. If Redis is slow or down it starts anyway, and the failure mode above applies until the client connects.
+
 Responses carry `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, and `Retry-After` on a 429.
 
 ## Caching
@@ -355,6 +357,8 @@ Scaling is near-linear to two workers, then limited by the machine rather than t
 | Chunked upload | The body is buffered and forwarded with an exact `Content-Length`, so it can be replayed on retry. Past `maxBodyBytes` the client gets a 413 with `Connection: close`, even with no `Content-Length` declared. |
 | Upstream dies mid-body | The status line has already gone out, so the client's connection is cut rather than ended normally. A truncated body is never presented as complete, never cached, and is counted as a 502 in metrics and logs. |
 | HTTPS upstream | Verified against Node's default CAs, or only the bundle in `tls.caFile`. There is deliberately no option to skip verification. TLS failures get a 502 and aren't retried, since a bad certificate won't fix itself. |
+| Every upstream connection busy | Waiting for a free connection to an upstream (`upstreams.*.maxConnections`) counts against the attempt timeout like connecting does, so a saturated upstream gives callers a 504 on time instead of leaving them queued behind other requests. |
+| Client stops reading its response | A client that accepts none of a response for `limits.responseStallTimeoutMs` (30 s) is dropped (`gateway_requests_shed_total{reason="slow_reader"}`, status 499 in the log), freeing the upstream connection. A client that is merely slow keeps its connection: the clock restarts whenever it takes data. The same holds for large cached entries, which are written in slices. If the dropped client was the one fetching a cache entry, the clients coalesced behind it wait at most that long before one of them takes over. |
 | Shutdown (`SIGTERM` / `SIGINT`) | The listener closes and idle keep-alive connections drop at once. In-flight requests finish, with `Connection: close`. Each connection closes as soon as its response completes, and anything still running after `shutdownGraceMs` is cut off. |
 
 ## Configuration
@@ -383,6 +387,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `limits` | `maxConnections`, `maxConnectionsPerIp` | `10000`, `0` (off) | Connection caps. The per-address cap is off by default because a load balancer opens every connection from one address; set it when clients connect to the gateway directly |
 | `limits` | `maxInFlight`, `maxBufferedBytes` | `2000`, 64 MiB | Load shedding (503) |
 | `limits` | `maxHeaderBytes`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs` | `16384`, `15000`, `60000`, `65000` | Protocol limits |
+| `limits` | `responseStallTimeoutMs` | `30000` | Drop a client that has taken none of its response for this long (see "Behaviour at the edges") |
 | `upstreams.*` | `url` **or** `urls`, `balance` | `-`, `round-robin` | One backend, or several |
 | `upstreams.*` | `timeoutMs`, `totalTimeoutMs` | `5000`, unset | Per-attempt and overall timeouts |
 | `upstreams.*.tls` | `caFile` | unset | PEM bundle for a privately signed `https://` upstream; replaces the default trust store for that upstream |
@@ -397,7 +402,8 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 
 Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 
-- `GET /_gateway/live`: always open, says only `{"status":"ok"}`. Use it for container/orchestrator probes.
+- `GET /_gateway/live`: always open, says only `{"status":"ok"}`. Liveness: is the process working? Point a container health check or a Kubernetes `livenessProbe` here.
+- `GET /_gateway/ready`: always open. Readiness: should traffic be sent here? `200 {"status":"ready"}` while serving; `503 {"status":"draining"}` from the moment shutdown begins, while the process is still alive and finishing the requests it has. Point a load balancer or `readinessProbe` here and the instance is taken out of rotation before it starts refusing connections, which `live` (rightly) never does. In cluster mode it is also 503 when no worker is ready.
 - `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats (token-gated when one is set)
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
@@ -486,6 +492,7 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
   REDIS_URL=redis://127.0.0.1:6379 npm test
   ```
 
+- **End-to-end tests** (`test/e2e/`) run everything as separate processes over real sockets and judge only what a client or operator could see: the shipped config driven exactly as the quick start says (cache, token bucket and refill, deadline, breaker open and recovery, upstream crash), then the whole product together (TLS, API keys and JWTs, a pool of two upstream instances with health checks while one is killed and restarted under load, request coalescing, WebSockets, two gateway processes sharing a budget, a cluster, shutdown) with a real Redis behind a proxy the test can freeze or sever mid-run, and clients that stop reading. `cluster`/`full` need `REDIS_URL`.
 - **Process test** ([`test/process.test.ts`](test/process.test.ts)) starts the real entrypoint and sends it `SIGTERM` mid-request (Linux/macOS).
 - **Cluster tests**: the supervisor (restart and backoff, crash loops, start-up failure, shutdown, the questions it asks workers) runs against fake workers and a fake clock ([`supervisor.test.ts`](test/supervisor.test.ts)), metrics merging and config are unit tests, and [`cluster.integration.test.ts`](test/cluster.integration.test.ts) starts the real entrypoint with several workers against Redis (shared limits, one scrape for all workers, a killed worker replaced, start-up refused when workers cannot start, `SIGTERM` draining on POSIX). Skipped without `REDIS_URL`.
 

@@ -14,6 +14,7 @@ RUN npm run build
 # Not part of the default build: `docker compose run --rm tests`.
 FROM build AS test
 COPY vitest.config.ts biome.json gateway.config.json ./
+COPY demo ./demo
 COPY test ./test
 CMD ["npx", "vitest", "run"]
 

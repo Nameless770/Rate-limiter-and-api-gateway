@@ -264,6 +264,7 @@ describe.skipIf(!redisUrl)('cluster mode (real processes)', { timeout: 60_000 },
         host: '127.0.0.1',
         cluster: { workers: 2 },
         redis: { url: redisUrl },
+        admin: { port: 0 },
         // The certificate does not exist, which only a worker finds out when it tries to serve.
         tls: { certFile: join(dir, 'missing-cert.pem'), keyFile: join(dir, 'missing-key.pem') },
         upstreams: { u: { url: up.url } },

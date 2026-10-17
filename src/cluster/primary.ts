@@ -61,12 +61,21 @@ export async function runPrimary(config: GatewayConfig, workers: number, logger:
   );
   const stopProcessMetrics = registerProcessMetrics(registry);
 
+  let shuttingDown = false;
   const admin = config.admin.enabled
     ? new AdminListener(config.admin, {
         live: () => {
           const ready = supervisor.ready;
           return ready > 0
             ? { status: 200, body: { status: 'ok', workers: ready } }
+            : { status: 503, body: { status: 'unavailable', workers: 0 } };
+        },
+        // Not ready the moment shutdown starts (workers are still draining behind it), or with nobody to serve.
+        ready: () => {
+          if (shuttingDown) return { status: 503, body: { status: 'draining' } };
+          const ready = supervisor.ready;
+          return ready > 0
+            ? { status: 200, body: { status: 'ready', workers: ready } }
             : { status: 503, body: { status: 'unavailable', workers: 0 } };
         },
         health: async () => {
@@ -93,7 +102,6 @@ export async function runPrimary(config: GatewayConfig, workers: number, logger:
       })
     : undefined;
 
-  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;

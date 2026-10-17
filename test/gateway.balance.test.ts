@@ -243,7 +243,8 @@ describe('upstream connection reuse', () => {
     const up = await upstream(async (_r, res) => {
       concurrent++;
       peak = Math.max(peak, concurrent);
-      await sleep(25);
+      // Long enough that the 60 requests overlap even when the machine is busy and they reach the upstream staggered.
+      await sleep(150);
       concurrent--;
       json(res, 200, { ok: true });
     });

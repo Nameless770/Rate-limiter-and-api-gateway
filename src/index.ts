@@ -8,6 +8,9 @@ import { createLogger, type Logger, type LogLevel } from './observability/logger
 import { createRedisClient } from './redisClient.js';
 import { securityNotes } from './security.js';
 
+/** The longest startup waits for Redis to connect (a little over the client's own 2 s connect timeout). */
+const REDIS_STARTUP_WAIT_MS = 2_500;
+
 async function main(): Promise<void> {
   const worker = cluster.isWorker ? Number(process.env['GATEWAY_WORKER_INDEX']) : undefined;
   const logger = createLogger(
@@ -37,8 +40,20 @@ async function runGateway(config: GatewayConfig, logger: Logger, isWorker: boole
 
   const redis = config.redis ? createRedisClient(config.redis, logger) : undefined;
   if (redis) {
-    // Don't block startup on Redis: if it's down the limiter's failure mode applies and we reconnect in the background.
-    redis.connect().catch((error: Error) => logger.warn('redis unavailable at startup', { error: error.message }));
+    // Give Redis a moment to connect before taking traffic. Otherwise every start, every rolling deploy, begins with
+    // a window in which this instance counts requests in its per-process fallback instead of the shared budget.
+    // But never hold startup hostage to it: if Redis is slow or down the limiter's failure mode applies and the
+    // client keeps reconnecting in the background.
+    const connecting = redis.connect().then(
+      () => undefined,
+      (error: Error) => logger.warn('redis unavailable at startup', { error: error.message }),
+    );
+    let timer: NodeJS.Timeout | undefined;
+    const gaveUp = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, REDIS_STARTUP_WAIT_MS);
+    });
+    await Promise.race([connecting, gaveUp]);
+    clearTimeout(timer);
   } else {
     logger.warn('no redis configured: rate limits are per-instance and reset on restart');
   }

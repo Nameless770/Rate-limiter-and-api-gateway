@@ -181,6 +181,9 @@ function headerSafe(value: string): string {
 /** Most a client may send before it has its 101. A well-behaved one sends nothing; this only bounds a bad one. */
 const MAX_EARLY_WS_BYTES = 64 * 1024;
 
+/** Cached bodies larger than this are written in pieces, so a client that stops reading can be noticed. */
+const WRITE_SLICE_BYTES = 64 * 1024;
+
 /** Longest request path written to an access-log line. */
 const MAX_LOGGED_PATH = 512;
 
@@ -424,6 +427,8 @@ export class Gateway {
 
     this.admin = new AdminListener(config.admin, {
       live: () => ({ status: 200, body: { status: 'ok' } }),
+      ready: () =>
+        this.closing ? { status: 503, body: { status: 'draining' } } : { status: 200, body: { status: 'ready' } },
       health: () => this.healthReport(),
       metrics: () => this.renderMetrics(),
     });
@@ -1053,7 +1058,7 @@ export class Gateway {
     if (!skipLookup) {
       const hit = this.cache.get(key, req.headers);
       if (hit) {
-        this.serveEntry(res, ctx, hit);
+        await this.serveEntry(res, ctx, hit);
         return;
       }
     }
@@ -1083,7 +1088,7 @@ export class Gateway {
       if (led || ctx.clientGone) return;
 
       if (value.kind === 'stored') {
-        this.serveEntry(res, ctx, value.entry);
+        await this.serveEntry(res, ctx, value.entry);
         return;
       }
       if (value.kind === 'not-stored') {
@@ -1096,11 +1101,40 @@ export class Gateway {
     }
   }
 
-  private serveEntry(res: ServerResponse, ctx: RequestContext, entry: CachedResponse): void {
+  private async serveEntry(res: ServerResponse, ctx: RequestContext, entry: CachedResponse): Promise<void> {
     ctx.cache = 'HIT';
     const age = Math.max(0, Math.floor((this.clock() - entry.storedAt) / 1000));
     res.writeHead(entry.status, { ...entry.headers, age: String(age), 'x-cache': 'HIT' });
-    res.end(entry.body);
+    const body = entry.body;
+    if (body.length <= WRITE_SLICE_BYTES) {
+      res.end(body); // fits in the socket's buffers whatever the client does, so there is nothing to wait for
+      return;
+    }
+    // A big entry goes out in slices so that a client which stops reading is noticed and dropped, not waited on.
+    for (let offset = 0; offset < body.length; offset += WRITE_SLICE_BYTES) {
+      if (res.destroyed) return;
+      const slice = body.subarray(offset, offset + WRITE_SLICE_BYTES);
+      if (!res.write(slice) && !(await this.drained(res, ctx))) return;
+    }
+    res.end();
+  }
+
+  /**
+   * Wait for a client to take the data it has been sent. False if it has gone, or has stopped reading for longer
+   * than `limits.responseStallTimeoutMs` (in which case it is dropped here).
+   */
+  private async drained(res: ServerResponse, ctx: RequestContext): Promise<boolean> {
+    const outcome = await waitForDrain(res, this.config.limits.responseStallTimeoutMs);
+    if (outcome === 'stalled') {
+      this.mShed.inc({ reason: 'slow_reader' });
+      this.logger.warn('dropping a client that stopped reading its response', {
+        requestId: ctx.requestId,
+        route: ctx.route,
+        stalledMs: this.config.limits.responseStallTimeoutMs,
+      });
+      res.destroy();
+    }
+    return outcome === 'drained';
   }
 
   // ------------------------------------------------------------------------------------------------------------------
@@ -1613,7 +1647,11 @@ export class Gateway {
           }
         }
         if (clientGone || res.destroyed) return { clientGone: true };
-        if (!res.write(chunk)) await waitForDrain(res);
+        if (!res.write(chunk) && !(await this.drained(res, ctx))) {
+          clientGone = true;
+          up.stream.destroy(); // this listener is gone before 'close' fires, so release the upstream here
+          return { clientGone: true };
+        }
       }
     } catch {
       if (clientGone) return { clientGone: true };
@@ -1871,15 +1909,20 @@ function closeSoon(socket: Duplex): void {
   socket.once('close', () => clearTimeout(timer));
 }
 
-function waitForDrain(res: ServerResponse): Promise<void> {
+/** Resolves when the client has taken what it was sent, has gone, or has taken nothing for `stallMs`. */
+function waitForDrain(res: ServerResponse, stallMs: number): Promise<'drained' | 'closed' | 'stalled'> {
   return new Promise((resolve) => {
-    const done = (): void => {
-      res.off('drain', done);
-      res.off('close', done);
-      resolve();
+    const done = (outcome: 'drained' | 'closed' | 'stalled'): void => {
+      clearTimeout(timer);
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      resolve(outcome);
     };
-    res.once('drain', done);
-    res.once('close', done);
+    const onDrain = (): void => done('drained');
+    const onClose = (): void => done('closed');
+    const timer = setTimeout(() => done('stalled'), stallMs);
+    res.once('drain', onDrain);
+    res.once('close', onClose);
   });
 }
 

@@ -35,6 +35,7 @@ describe.skipIf(process.platform === 'win32')('process lifecycle (POSIX signals)
         port: 0,
         host: '127.0.0.1',
         shutdownGraceMs: 5_000,
+        admin: { port: 0 },
         upstreams: { u: { url: up.url } },
         routes: [{ path: '/', upstream: 'u' }],
       }),

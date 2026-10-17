@@ -1,5 +1,5 @@
 /**
- * The admin listener: liveness, health and metrics, on its own port and apart from proxied traffic.
+ * The admin listener: liveness, readiness, health and metrics, on its own port and apart from proxied traffic.
  *
  * It knows nothing about the gateway. Where its answers come from is passed in, so one gateway process serves its
  * own state and a cluster's primary process serves the combined state of its workers through the same code (and
@@ -18,8 +18,14 @@ export interface AdminAnswer {
 }
 
 export interface AdminSources {
-  /** Liveness. Served without the token, so an orchestrator can probe it. */
+  /** Liveness: is the process working at all? Served without the token, so an orchestrator can probe it. */
   live(): AdminAnswer;
+  /**
+   * Readiness: should new traffic be sent here? Also served without the token. It is what a load balancer should
+   * watch: it turns to "no" the moment shutdown begins, while the process is still alive and still finishing the
+   * requests it has, so traffic is steered away before connections start being refused.
+   */
+  ready(): AdminAnswer;
   health(): unknown | Promise<unknown>;
   metrics(): string | Promise<string>;
 }
@@ -90,6 +96,7 @@ export class AdminListener {
     }
 
     if (pathname === '/_gateway/live') return this.sources.live();
+    if (pathname === '/_gateway/ready') return this.sources.ready();
 
     if (this.tokenDigest && !this.authorized(req)) {
       return { status: 401, body: { error: { code: 'unauthorized' } }, headers: { 'www-authenticate': 'Bearer' } };

@@ -135,18 +135,27 @@ export class UpstreamClient {
         },
       );
 
-      // Covers connect + time to first byte. The socket idle timeout below covers the rest of the exchange.
-      const timeoutMs = req.timeoutMs ?? this.timeoutMs;
-      const headerTimer = setTimeout(() => {
-        outgoing.destroy(new UpstreamError('timeout', `no response within ${timeoutMs}ms`));
-      }, timeoutMs);
-      outgoing.setTimeout(timeoutMs, () => {
-        outgoing.destroy(new UpstreamError('timeout', `upstream idle for ${timeoutMs}ms`));
-      });
-
-      const onAbort = (): void => {
-        outgoing.destroy(new UpstreamError('aborted', 'client went away'));
+      // Give up on the attempt. Destroying the request is not enough on its own: while the pool is full (maxSockets)
+      // a request waits in the agent's queue with no socket, and destroying it then does nothing until a socket
+      // frees up, which would let a saturated upstream hold callers far past their deadline. So settle the promise
+      // here as well; the destroyed request is discarded when its turn comes.
+      const giveUp = (error: UpstreamError): void => {
+        clearTimeout(headerTimer);
+        req.signal?.removeEventListener('abort', onAbort);
+        outgoing.destroy(error);
+        reject(error);
       };
+
+      // Covers waiting for a connection, connecting, and time to first byte. The socket idle timeout below covers
+      // the rest of the exchange.
+      const timeoutMs = req.timeoutMs ?? this.timeoutMs;
+      const headerTimer = setTimeout(
+        () => giveUp(new UpstreamError('timeout', `no response within ${timeoutMs}ms`)),
+        timeoutMs,
+      );
+      outgoing.setTimeout(timeoutMs, () => giveUp(new UpstreamError('timeout', `upstream idle for ${timeoutMs}ms`)));
+
+      const onAbort = (): void => giveUp(new UpstreamError('aborted', 'client went away'));
       req.signal?.addEventListener('abort', onAbort, { once: true });
 
       if (allowUpgrade) {

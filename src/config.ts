@@ -449,6 +449,13 @@ export const configSchema = z
         /** Time a client gets to finish sending a whole request. */
         requestTimeoutMs: positiveInt.default(60_000),
         keepAliveTimeoutMs: positiveInt.default(65_000),
+        /**
+         * A client that accepts none of a response for this long is dropped. Without it a client that asks for a
+         * large response and never reads it holds an upstream connection (and a cache fetch other clients may be
+         * waiting on) for as long as it likes. A slow client that keeps reading is never affected: the clock
+         * restarts every time it takes some data.
+         */
+        responseStallTimeoutMs: positiveInt.default(30_000),
       })
       .prefault({}),
 
