@@ -78,6 +78,42 @@ describe('circuit breaker', () => {
     expect(breaker.tryAcquire()).toBeDefined(); // slot freed
   });
 
+  it('can be told to probe now: an open circuit goes straight to half-open, and still has to earn its way back', () => {
+    const { breaker, call, transitions, advance } = setup();
+    for (let i = 0; i < 4; i++) call(false);
+    expect(breaker.state).toBe('open');
+    advance(1_000); // far short of the 5 s cool-down
+    expect(breaker.tryAcquire()).toBeUndefined();
+
+    breaker.probeNow();
+    expect(breaker.state).toBe('half-open');
+    expect(transitions).toEqual(['closed->open', 'open->half-open']);
+    expect(call(true)).toBe(true); // a probe is admitted...
+    expect(breaker.state).toBe('half-open'); // ...but one success is not enough (halfOpenSuccesses is 2)
+    expect(call(true)).toBe(true);
+    expect(breaker.state).toBe('closed');
+  });
+
+  it('re-opens on the first failed probe after being told to probe now', () => {
+    const { breaker, call, advance } = setup();
+    for (let i = 0; i < 4; i++) call(false);
+    breaker.probeNow();
+    call(false);
+    expect(breaker.state).toBe('open');
+    advance(4_999);
+    expect(breaker.tryAcquire()).toBeUndefined(); // and a full cool-down applies again
+  });
+
+  it('probeNow does nothing unless the circuit is open', () => {
+    const { breaker, call, transitions } = setup();
+    breaker.probeNow();
+    expect(breaker.state).toBe('closed');
+    for (let i = 0; i < 4; i++) call(false);
+    breaker.probeNow();
+    breaker.probeNow(); // already half-open
+    expect(transitions).toEqual(['closed->open', 'open->half-open']);
+  });
+
   it('closes after enough consecutive probe successes', () => {
     const { breaker, call, advance, transitions } = setup();
     for (let i = 0; i < 4; i++) call(false);

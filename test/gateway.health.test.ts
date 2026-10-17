@@ -23,19 +23,21 @@ interface Switchable {
   up: FakeUpstream;
   healthStatus: number;
   healthDelayMs: number;
+  /** What every path other than the health endpoint answers (200 unless a test makes the target fail). */
+  proxiedStatus: number;
   /** Requests that were not health probes: the traffic the gateway actually proxied here. */
   proxied(): number;
   probes(): FakeUpstream['hits'];
 }
 
 async function target(name: string, tls?: { key: Buffer; cert: Buffer }, healthPath = '/health'): Promise<Switchable> {
-  const state = { healthStatus: 200, healthDelayMs: 0 };
+  const state = { healthStatus: 200, healthDelayMs: 0, proxiedStatus: 200 };
   const handler: UpstreamHandler = async (_r, res, hit) => {
     if (hit.url.split('?')[0]?.endsWith(healthPath)) {
       if (state.healthDelayMs) await sleep(state.healthDelayMs);
       return json(res, state.healthStatus, { name });
     }
-    return json(res, 200, { from: name });
+    return json(res, state.proxiedStatus, { from: name });
   };
   const up = await startUpstream(handler, tls ? { tls } : {});
   cleanups.push(up.close);
@@ -46,6 +48,12 @@ async function target(name: string, tls?: { key: Buffer; cert: Buffer }, healthP
     },
     set healthStatus(v: number) {
       state.healthStatus = v;
+    },
+    get proxiedStatus() {
+      return state.proxiedStatus;
+    },
+    set proxiedStatus(v: number) {
+      state.proxiedStatus = v;
     },
     get healthDelayMs() {
       return state.healthDelayMs;
@@ -145,6 +153,31 @@ describe('active health checks', () => {
     await times(2, () => g.gateway.checkHealthNow());
     expect((await get(g)).status).toBe(200);
     expect((await adminJson(g, '/_gateway/health')).upstreams.pool.targets[0].healthy).toBe(false);
+  });
+
+  it('let a re-admitted target be probed at once, rather than wait out a breaker cool-down from when it was failing', async () => {
+    const [a, b] = [await target('a'), await target('b')];
+    const g = await gateway([a.up.url, b.up.url], hc, {
+      // A cool-down so long (in the test clock's time) that only the health check can end it.
+      breaker: { minimumRequests: 2, failureRateThreshold: 0.5, openDurationMs: 3_600_000, halfOpenSuccesses: 1 },
+    });
+    const breaker = g.gateway.circuits('pool')[b.up.url.replace('http://', '')];
+
+    b.proxiedStatus = 500;
+    await times(8, () => get(g));
+    expect(breaker?.state).toBe('open'); // traffic has tripped it
+
+    b.proxiedStatus = 200; // the target is fixed...
+    b.healthStatus = 503;
+    await times(2, () => g.gateway.checkHealthNow()); // ...but first the health check notices it was bad
+    expect(breaker?.state).toBe('open'); // a bad verdict is no reason to start probing it
+    b.healthStatus = 200;
+    await times(2, () => g.gateway.checkHealthNow()); // and then that it is good again
+
+    const before = b.proxied();
+    await times(10, () => get(g));
+    expect(b.proxied() - before).toBeGreaterThan(3); // it is back in service...
+    expect(breaker?.state).toBe('closed'); // ...having proved itself on real requests, not on the clock
   });
 
   it('treat a slow health endpoint as unhealthy', async () => {

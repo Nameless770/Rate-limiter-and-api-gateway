@@ -659,7 +659,12 @@ export class Gateway {
           this.mHealthChecks.inc({ upstream: upstream.name, target: id, result: result.ok ? 'ok' : 'fail' }),
         onChange: (id, healthy, reason) => {
           const target = byId.get(id);
-          if (target) target.healthy = healthy;
+          if (target) {
+            target.healthy = healthy;
+            // The target was just shown to be back, so don't make real traffic wait out a cool-down that was set
+            // when it was failing: let the breaker probe it now (it re-opens on the first failure, as ever).
+            if (healthy) target.breaker.probeNow();
+          }
           this.mHealthTransitions.inc({ upstream: upstream.name, target: id, to: healthy ? 'healthy' : 'unhealthy' });
           this.logger.warn('health check verdict changed', { upstream: upstream.name, target: id, healthy, reason });
         },

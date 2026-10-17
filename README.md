@@ -185,6 +185,7 @@ Many frameworks build absolute links or error pages from headers like `X-Forward
 
 - Each target is probed on its own schedule (±10% jitter, so a fleet of gateways doesn't probe in lockstep), over a **dedicated connection** that doesn't queue behind proxied traffic.
 - `unhealthyThreshold` consecutive failures take a target out of rotation; `healthyThreshold` consecutive successes put it back. A failure (timeout, refused, TLS error, unexpected status) in the middle of a recovery resets the count.
+- **Re-admission also fast-forwards the circuit breaker.** A target that failed under traffic usually has its breaker open, with a cool-down set while it was failing. When the health check shows the target is back, an open breaker moves straight to half-open, so real requests probe it at once (and a failed probe re-opens it as usual) instead of a healthy instance sitting idle for the rest of `openDurationMs`. An unhealthy verdict never does this.
 - **If every target is unhealthy, the verdict is ignored** and the breakers alone decide ("panic mode"): a wrong health path or a flapping probe must not be able to take a service offline.
 - A target is trusted until proven otherwise, so startup doesn't black-hole traffic during the first interval.
 - Probes are not requests: they don't touch the breaker, the rate limiter or the cache. They can carry extra headers (`headers`), use `HEAD`, and accept specific statuses (`expectStatus`; default any 2xx). The two mechanisms complement each other: the breaker still catches failures a probe misses (a healthy `/healthz` over a broken endpoint).
@@ -480,6 +481,7 @@ npm run check                   # typecheck + lint + tests
 docker compose run --rm tests   # the whole suite on Linux, against the Compose Redis
 ```
 
+- **Two phases.** `npm test` runs the in-process tests first, in parallel, and then the tests that start real processes and race real clocks (`test/e2e/`, the cluster integration test, the process test) one file at a time (see `vitest.config.ts`). They are heavy and sensitive to a starved CPU, and they would otherwise starve tests such as the Redis parity checks, where Redis expires keys in real time while the test drives an injected clock.
 - **Unit tests** drive the algorithms, breaker and retry loop with injected clocks, so boundary conditions are exact rather than timing-dependent.
 - **End-to-end tests** run the real gateway against real HTTP servers acting as upstreams: proxying, headers, limits, caching, coalescing, retries, timeouts, breaker lifecycle, balancing, per-target ejection, and the Redis failure modes (via a stub client).
 - **Security and hardening tests** ([`gateway.security.test.ts`](test/gateway.security.test.ts), [`hardening.test.ts`](test/hardening.test.ts)) attack the gateway: key rotation, cache poisoning, header spoofing, smuggling-shaped framing, slowloris, resource exhaustion.

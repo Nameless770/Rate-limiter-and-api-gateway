@@ -150,6 +150,15 @@ export class CircuitBreaker {
     };
   }
 
+  /**
+   * Let probes through now instead of waiting out the rest of the open duration. For when something other than
+   * traffic has just shown the target is back (an active health check). Only an OPEN circuit is affected, and the
+   * target is not trusted yet: the next calls are probes, and a failed one opens the circuit again as usual.
+   */
+  probeNow(): void {
+    if (this.current === 'open') this.transition('half-open');
+  }
+
   /** Force the breaker back to CLOSED with a clean slate (admin/testing). */
   reset(): void {
     this.transition('closed');
