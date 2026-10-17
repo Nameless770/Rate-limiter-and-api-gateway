@@ -2,7 +2,7 @@
 # Dependabot (see .github/dependabot.yml) proposes updates. Refresh by hand with:
 #   docker pull node:24-alpine && docker image inspect node:24-alpine --format '{{index .RepoDigests 0}}'
 
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS build
+FROM node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -19,7 +19,7 @@ COPY test ./test
 CMD ["npx", "vitest", "run"]
 
 # The demo upstream is a separate, minimal image so that nothing demo-related ships in the gateway image.
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS demo-upstream
+FROM node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS demo-upstream
 ENV NODE_ENV=production
 WORKDIR /app
 COPY demo/flaky-upstream.mjs ./demo/flaky-upstream.mjs
@@ -28,7 +28,7 @@ EXPOSE 9001
 CMD ["node", "demo/flaky-upstream.mjs"]
 
 # The gateway. Last stage, so a plain `docker build .` produces this one.
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS runtime
+FROM node:25-alpine@sha256:bdf2cca6fe3dabd014ea60163eca3f0f7015fbd5c7ee1b0e9ccb4ced6eb02ef4 AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
