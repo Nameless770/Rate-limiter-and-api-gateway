@@ -11,8 +11,17 @@ export interface CachedResponse {
   body: Buffer;
   storedAt: number;
   expiresAt: number;
+  /** Until when it may be served stale while a fresh copy is fetched (unset: it may not). */
+  staleWhileRevalidateUntil?: number;
+  /** Until when it may stand in for a failing upstream (unset: it may not). */
+  staleIfErrorUntil?: number;
   /** Request header values this variant was stored under, for the upstream's `Vary` list. */
   vary: Record<string, string | undefined>;
+}
+
+/** An entry is kept until the last moment any use of it, fresh or stale, is allowed. */
+function retainUntil(entry: CachedResponse): number {
+  return Math.max(entry.expiresAt, entry.staleWhileRevalidateUntil ?? 0, entry.staleIfErrorUntil ?? 0);
 }
 
 export interface ResponseCacheOptions {
@@ -27,6 +36,8 @@ export interface CacheStats {
   entries: number;
   bytes: number;
   hits: number;
+  /** Lookups that found only a stale entry still inside one of its stale windows. */
+  stale: number;
   misses: number;
   evictions: number;
   coalesced: number;
@@ -49,6 +60,7 @@ export class ResponseCache {
   private readonly clock: Clock;
   private bytes = 0;
   private hits = 0;
+  private staleHits = 0;
   private misses = 0;
   private evictions = 0;
   private coalesced = 0;
@@ -63,12 +75,27 @@ export class ResponseCache {
 
   /** Fresh entry for `key` whose stored `Vary` values match this request's headers, if any. */
   get(key: string, requestHeaders: Record<string, string | string[] | undefined>): CachedResponse | undefined {
+    const found = this.lookup(key, requestHeaders);
+    return found?.fresh ? found.entry : undefined;
+  }
+
+  /**
+   * The entry for `key` whose stored `Vary` values match this request, and whether it is still fresh. A stale entry
+   * comes back only while one of its stale windows is open (the caller decides which use is allowed); once they have
+   * all closed it is dropped.
+   */
+  lookup(
+    key: string,
+    requestHeaders: Record<string, string | string[] | undefined>,
+  ): { entry: CachedResponse; fresh: boolean } | undefined {
     const entry = this.entries.get(key);
     if (!entry) {
       this.misses++;
       return undefined;
     }
-    if (entry.expiresAt <= this.clock()) {
+    const now = this.clock();
+    const fresh = entry.expiresAt > now;
+    if (!fresh && retainUntil(entry) <= now) {
       this.remove(key, entry);
       this.misses++;
       return undefined;
@@ -84,8 +111,14 @@ export class ResponseCache {
     // Mark as most recently used.
     this.entries.delete(key);
     this.entries.set(key, entry);
-    this.hits++;
-    return entry;
+    if (fresh) this.hits++;
+    else this.staleHits++;
+    return { entry, fresh };
+  }
+
+  /** A fetch for `key` is under way (one started through {@link singleFlight}). */
+  isInFlight(key: string): boolean {
+    return this.inflight.has(key);
   }
 
   set(key: string, entry: CachedResponse): boolean {
@@ -110,6 +143,13 @@ export class ResponseCache {
   delete(key: string): void {
     const entry = this.entries.get(key);
     if (entry) this.remove(key, entry);
+  }
+
+  /** Drop every entry whose key matches. */
+  deleteWhere(matches: (key: string) => boolean): void {
+    for (const [key, entry] of [...this.entries]) {
+      if (matches(key)) this.remove(key, entry);
+    }
   }
 
   clear(): void {
@@ -142,6 +182,7 @@ export class ResponseCache {
       entries: this.entries.size,
       bytes: this.bytes,
       hits: this.hits,
+      stale: this.staleHits,
       misses: this.misses,
       evictions: this.evictions,
       coalesced: this.coalesced,

@@ -11,6 +11,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The images track Node's LTS line. A new major is a deliberate upgrade (to the next even-numbered LTS, once it
+      # is LTS), not something to take because it was published: odd majors (25, 27, ...) are never LTS.
+      - dependency-name: node
+        update-types: [version-update:semver-major]
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -6,7 +6,7 @@
 import cluster from 'node:cluster';
 import { availableParallelism } from 'node:os';
 import { AdminListener } from '../admin.js';
-import type { GatewayConfig } from '../config.js';
+import { type GatewayConfig, loadConfig } from '../config.js';
 import type { Logger } from '../observability/logger.js';
 import { Registry } from '../observability/metrics.js';
 import { registerProcessMetrics } from '../observability/process.js';
@@ -35,7 +35,12 @@ export function clusterLauncher(): WorkerLauncher {
   };
 }
 
-export async function runPrimary(config: GatewayConfig, workers: number, logger: Logger): Promise<void> {
+export async function runPrimary(
+  config: GatewayConfig,
+  workers: number,
+  logger: Logger,
+  configPath: string,
+): Promise<void> {
   const startedAt = Date.now();
   let port = config.port;
   const supervisor = new Supervisor({
@@ -60,6 +65,46 @@ export async function runPrimary(config: GatewayConfig, workers: number, logger:
     'counter',
   );
   const stopProcessMetrics = registerProcessMetrics(registry);
+
+  /**
+   * Reload every worker's configuration. The primary reads and validates the file first, so a file that does not parse
+   * is refused once rather than by every worker; each worker then re-reads it and applies it on its own, all or
+   * nothing, and the answer lists how each one fared.
+   */
+  const reloadCluster = async (): Promise<{ ok: boolean } & Record<string, unknown>> => {
+    let next: GatewayConfig;
+    try {
+      next = loadConfig(configPath);
+    } catch (error) {
+      const message = (error as Error).message;
+      logger.error('configuration reload failed; the workers keep the previous configuration', { error: message });
+      return { ok: false, error: message };
+    }
+    // The primary's own settings: the number of workers and the admin listener's address are fixed once running.
+    const restartRequired: string[] = [];
+    if (resolveWorkers(next.cluster.workers) !== workers) restartRequired.push('cluster');
+    const { admin: was } = config;
+    if (next.admin.enabled !== was.enabled || next.admin.host !== was.host || next.admin.port !== was.port) {
+      restartRequired.push('admin');
+    }
+    admin?.setToken(next.admin.token);
+
+    logger.info('asking the workers to reload the configuration', { workers });
+    const replies = await supervisor.collect('reload');
+    const results = replies.map((r) =>
+      r.ok
+        ? { worker: r.index, ...(r.payload as Record<string, unknown>) }
+        : { worker: r.index, ok: false, error: r.reason },
+    );
+    const ok = results.every((r) => r.ok === true);
+    if (ok) logger.info('every worker reloaded the configuration', { workers, restartRequired });
+    else {
+      logger.error('not every worker reloaded the configuration', {
+        failed: results.filter((r) => r.ok !== true).map((r) => r.worker),
+      });
+    }
+    return { ok, restartRequired, workers: results };
+  };
 
   let shuttingDown = false;
   const admin = config.admin.enabled
@@ -99,6 +144,10 @@ export async function runPrimary(config: GatewayConfig, workers: number, logger:
             ...replies.flatMap((r) => (r.ok ? [{ worker: String(r.index), text: r.payload as string }] : [])),
           ]);
         },
+        reload: async () => {
+          const result = await reloadCluster();
+          return { status: result.ok ? 200 : 422, body: result };
+        },
       })
     : undefined;
 
@@ -116,12 +165,10 @@ export async function runPrimary(config: GatewayConfig, workers: number, logger:
   };
   process.on('SIGINT', () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
-  // Certificate renewal: SIGHUP to the primary reaches every worker. (Windows has no such signal.)
-  if (config.tls && process.platform !== 'win32') {
-    process.on('SIGHUP', () => {
-      logger.info('asking the workers to reload the tls certificate');
-      supervisor.broadcast({ gw: 'reload-tls' });
-    });
+  // SIGHUP to the primary reloads every worker's configuration, certificate files included. (Windows has no such
+  // signal; POST /_gateway/reload does the same.)
+  if (process.platform !== 'win32') {
+    process.on('SIGHUP', () => void reloadCluster());
   }
 
   try {

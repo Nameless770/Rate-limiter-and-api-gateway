@@ -402,8 +402,8 @@ describe('asking the workers', () => {
     const { launcher, supervisor } = await running({ workers: 3 });
     launcher.current(1).exit(1);
     launcher.current(2).throwOnSend = true;
-    supervisor.broadcast({ gw: 'reload-tls' });
-    expect(launcher.launched[0]?.sent).toEqual([{ gw: 'reload-tls' }]);
+    supervisor.broadcast({ gw: 'shutdown' });
+    expect(launcher.launched[0]?.sent).toEqual([{ gw: 'shutdown' }]);
     expect(launcher.launched[1]?.sent).toEqual([]);
   });
 });

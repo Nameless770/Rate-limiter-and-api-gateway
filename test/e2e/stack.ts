@@ -6,7 +6,7 @@
  * than something it is started into). Nothing is stubbed in the gateway's process.
  */
 import { type ChildProcess, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -144,8 +144,18 @@ export interface GatewayProc {
   adminBase: string;
   /** Admin bearer token, when the config has one. */
   adminToken?: string;
+  /** The file the gateway was started with. */
+  configPath: string;
+  /** Replace the file's contents (with the same test-safe address defaults); the gateway notices on a reload. */
+  rewrite(config: Record<string, unknown>): void;
   metrics(): Promise<string>;
   health(): Promise<Loose>;
+}
+
+/** Test-safe defaults: loopback, a free port, and its own admin port (the default 9090 would be shared). */
+function forTest(config: Record<string, unknown>): Record<string, unknown> {
+  const admin = { port: 0, ...((config['admin'] as object | undefined) ?? {}) };
+  return { host: '127.0.0.1', port: 0, ...config, admin };
 }
 
 export async function startGatewayProc(
@@ -155,11 +165,31 @@ export async function startGatewayProc(
   const dir = mkdtempSync(join(tmpdir(), 'gw-e2e-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'gateway.json');
-  // Its own admin port too: the default (9090) is shared by every gateway that does not say otherwise, and test files
-  // run in parallel.
-  const admin = { port: 0, ...((config['admin'] as object | undefined) ?? {}) };
-  writeFileSync(path, JSON.stringify({ host: '127.0.0.1', port: 0, ...config, admin }));
+  writeFileSync(path, JSON.stringify(forTest(config)));
+  const gw = await launchGateway(path, { tls: Boolean(config['tls']), admin: config['admin'] }, env);
+  return { ...gw, rewrite: (next) => writeFileSync(path, JSON.stringify(forTest(next))) };
+}
 
+/**
+ * Start the gateway on a config file exactly as it is (the shipped one, say), relying on the environment for anything
+ * that must differ in a test (PORT, ADMIN_PORT, ...).
+ */
+export async function startGatewayFromFile(path: string, env: NodeJS.ProcessEnv = {}): Promise<GatewayProc> {
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  const gw = await launchGateway(path, { tls: Boolean(raw['tls']), admin: undefined }, env);
+  return {
+    ...gw,
+    rewrite: () => {
+      throw new Error('this gateway runs on a file the test does not own');
+    },
+  };
+}
+
+async function launchGateway(
+  path: string,
+  shape: { tls: boolean; admin: unknown },
+  env: NodeJS.ProcessEnv,
+): Promise<Omit<GatewayProc, 'rewrite'>> {
   const proc = spawnNode(['--import', 'tsx', 'src/index.ts', path], env);
   const listening = await new Promise<Record<string, unknown>>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`gateway did not start:\n${proc.output()}`)), 40_000);
@@ -178,15 +208,16 @@ export async function startGatewayProc(
     });
   });
 
-  const scheme = (config['tls'] ? 'https' : 'http') as string;
+  const scheme = shape.tls ? 'https' : 'http';
   const adminBase = `http://127.0.0.1:${listening['adminPort']}`;
-  const adminToken = (config['admin'] as { token?: string } | undefined)?.token;
+  const adminToken = (shape.admin as { token?: string } | undefined)?.token;
   const headers: Record<string, string> = adminToken ? { authorization: `Bearer ${adminToken}` } : {};
   return {
     proc,
     base: `${scheme}://127.0.0.1:${listening['port']}`,
     adminBase,
     adminToken,
+    configPath: path,
     metrics: async () => (await rawRequest(adminBase, { path: '/_gateway/metrics', headers })).body,
     health: async () => JSON.parse((await rawRequest(adminBase, { path: '/_gateway/health', headers })).body),
   };

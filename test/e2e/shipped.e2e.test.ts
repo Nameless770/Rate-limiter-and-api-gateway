@@ -5,7 +5,6 @@
  *
  * Needs no Redis (limits are per process in this setup).
  */
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { rawRequest, sleep } from '../helpers.js';
@@ -17,7 +16,7 @@ import {
   metric,
   projectRoot,
   startDemoUpstream,
-  startGatewayProc,
+  startGatewayFromFile,
   until,
 } from './stack.js';
 
@@ -25,12 +24,10 @@ afterEach(cleanupAll);
 
 async function boot(): Promise<{ demo: DemoUpstream; gw: GatewayProc }> {
   const demo = await startDemoUpstream();
-  const shipped = JSON.parse(readFileSync(join(projectRoot, 'gateway.config.json'), 'utf8')) as {
-    admin: { port: number };
-  };
-  shipped.admin.port = 0; // only so a test run does not need :9090 to be free
-  const gw = await startGatewayProc(shipped as unknown as Record<string, unknown>, {
+  // The file itself, unmodified; only the documented environment overrides differ (free ports, the demo's address).
+  const gw = await startGatewayFromFile(join(projectRoot, 'gateway.config.json'), {
     PORT: '0',
+    ADMIN_PORT: '0',
     UPSTREAM_URL: demo.url,
   });
   return { demo, gw };

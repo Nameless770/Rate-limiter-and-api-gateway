@@ -69,16 +69,30 @@ export interface StoreDecision {
   ttlMs: number;
   /** Request header names the upstream said the response varies on. */
   vary: string[];
+  /** How long after going stale the entry may still be served at once while a fresh copy is fetched (RFC 5861). */
+  staleWhileRevalidateMs: number;
+  /** How long after going stale the entry may stand in for an upstream that is failing (RFC 5861). */
+  staleIfErrorMs: number;
 }
+
+/** A route's stale windows, used when the upstream's Cache-Control does not give its own. */
+export interface StaleDefaults {
+  whileRevalidateMs: number;
+  ifErrorMs: number;
+}
+
+const NO_STALE: StaleDefaults = { whileRevalidateMs: 0, ifErrorMs: 0 };
 
 /**
  * Decide whether a response may be stored. Returns undefined to mean "do not store".
- * `defaultTtlMs` applies only when the upstream expressed no opinion about freshness.
+ * `defaultTtlMs` applies only when the upstream expressed no opinion about freshness, and `stale` only when it
+ * expressed none about serving the response stale.
  */
 export function storeDecision(
   status: number,
   headers: IncomingHttpHeaders,
   defaultTtlMs: number,
+  stale: StaleDefaults = NO_STALE,
 ): StoreDecision | undefined {
   if (status !== 200) return undefined;
 
@@ -102,6 +116,22 @@ export function storeDecision(
   const age = typeof ageHeader === 'string' ? Number(ageHeader) : 0;
   if (Number.isFinite(age) && age > 0) ttlMs -= age * 1000;
 
-  if (ttlMs <= 0) return undefined;
-  return { ttlMs, vary };
+  // RFC 9111 4.2.4: a stale response must never be served against must-revalidate or proxy-revalidate. s-maxage
+  // carries proxy-revalidate's meaning for a shared cache, so a route's own defaults do not apply over it; an
+  // explicit stale-while-revalidate / stale-if-error from the upstream (RFC 5861) is its own permission and does.
+  const forbidden = cc.has('must-revalidate') || cc.has('proxy-revalidate');
+  const window = (directive: string, fallbackMs: number): number => {
+    if (forbidden) return 0;
+    const given = seconds(cc, directive);
+    if (given !== undefined) return given * 1000;
+    return cc.has('s-maxage') ? 0 : fallbackMs;
+  };
+  // A response that arrives already stale (Age beyond its lifetime) has used up that much of its windows too.
+  const overdue = Math.max(0, -ttlMs);
+  const staleWhileRevalidateMs = Math.max(0, window('stale-while-revalidate', stale.whileRevalidateMs) - overdue);
+  const staleIfErrorMs = Math.max(0, window('stale-if-error', stale.ifErrorMs) - overdue);
+
+  // Fresh for no time at all is still worth keeping if it may be served stale ("max-age=0, stale-while-revalidate").
+  if (ttlMs <= 0 && staleWhileRevalidateMs <= 0 && staleIfErrorMs <= 0) return undefined;
+  return { ttlMs: Math.max(0, ttlMs), vary, staleWhileRevalidateMs, staleIfErrorMs };
 }

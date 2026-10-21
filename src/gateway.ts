@@ -8,7 +8,13 @@ import { createSecureContext, type TLSSocket } from 'node:tls';
 import type { Redis } from 'ioredis';
 import { AdminListener } from './admin.js';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
-import { requestCacheInfo, requestIsCacheSafe, storeDecision } from './cache/policy.js';
+import {
+  requestCacheInfo,
+  requestIsCacheSafe,
+  type StaleDefaults,
+  type StoreDecision,
+  storeDecision,
+} from './cache/policy.js';
 import { type CachedResponse, ResponseCache } from './cache/responseCache.js';
 import {
   ConfigError,
@@ -23,6 +29,7 @@ import { listenOn } from './net/listen.js';
 import { createLogger, type Logger } from './observability/logger.js';
 import { Registry } from './observability/metrics.js';
 import { registerProcessMetrics } from './observability/process.js';
+import { childOf, formatTraceparent, startOrContinue, type TraceContext } from './observability/trace.js';
 import { sanitizeRequestId, stripHopByHop } from './proxy/headers.js';
 import { UpstreamClient, UpstreamError, type UpstreamResponse } from './proxy/upstream.js';
 import {
@@ -59,7 +66,24 @@ export interface GatewayDeps {
   /** Test seams for deterministic retry timing. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
+  /**
+   * Read the configuration again (from the file it came from). Enables reloading through SIGHUP and the admin
+   * listener's POST /_gateway/reload; without it {@link Gateway.reloadFromSource} reports there is nothing to read.
+   */
+  loadConfig?: () => GatewayConfig;
 }
+
+export type ReloadResult =
+  | {
+      ok: true;
+      /** Counts configurations applied: 1 at start-up, then one more per successful reload. */
+      generation: number;
+      /** Top-level sections that differed. */
+      changed: string[];
+      /** Settings that changed in the file but keep their old values until a restart. */
+      restartRequired: string[];
+    }
+  | { ok: false; error: string };
 
 interface Target {
   /** Stable label for metrics and health output (host:port). */
@@ -84,6 +108,12 @@ interface UpstreamRuntime {
     /** One dedicated client per target: probes must not queue behind (or be starved by) proxied traffic. */
     clients: Map<string, UpstreamClient>;
   };
+  /** Its configuration plus the contents of any files it reads: a reload that leaves this unchanged keeps it. */
+  fingerprint: string;
+  /** Calls under way that use its connections, so a replaced upstream is closed only once they have finished. */
+  users: number;
+  /** Replaced by a reload: no new calls, and its connections close when the last user is done. */
+  retired: boolean;
 }
 
 interface RouteLimiter {
@@ -91,7 +121,47 @@ interface RouteLimiter {
   tag: string;
 }
 
+/**
+ * Everything derived from one version of the configuration. A reload builds a new one beside it and swaps it in;
+ * a request keeps the runtime it started with, so it never sees half of one configuration and half of another.
+ */
+interface Runtime {
+  generation: number;
+  config: GatewayConfig;
+  router: Router;
+  upstreams: Map<string, UpstreamRuntime>;
+  /** The rule each route applies before plans, overrides and multipliers. */
+  routeRules: Map<string, RateLimitRuleConfig | undefined>;
+  /** Each route's timeouts, retries and body limit: its own settings over its upstream's. */
+  routePolicies: Map<string, RoutePolicy>;
+  identities: IdentityResolver;
+  jwt?: JwtVerifier;
+  /** Rate-limit multiplier per JWT issuer name (from the issuer's plan). */
+  jwtMultiplier: Map<string, number>;
+  allowedMethods: Set<string>;
+  ipCeiling?: RouteLimiter;
+  /** The TLS certificate and key, read and checked while building (TLS only). */
+  tls?: TlsMaterial;
+}
+
+/** How calls for one route are made: its own settings where it has them, its upstream's where it does not. */
+interface RoutePolicy {
+  timeoutMs: number;
+  totalTimeoutMs?: number;
+  retry: UpstreamConfig['retry'];
+  maxBodyBytes: number;
+}
+
+interface TlsMaterial {
+  cert: Buffer;
+  key: Buffer;
+  passphrase?: string;
+  notAfter: Date;
+}
+
 interface RequestContext {
+  /** The configuration this request runs under, from start to finish. */
+  rt: Runtime;
   requestId: string;
   method: string;
   path: string;
@@ -99,7 +169,7 @@ interface RequestContext {
   upstream?: string;
   /** Name of the registered API key, when there is one (never the key itself). */
   client?: string;
-  cache?: 'HIT' | 'MISS' | 'BYPASS';
+  cache?: 'HIT' | 'STALE' | 'MISS' | 'BYPASS';
   attempts: number;
   rateLimited: boolean;
   degraded: boolean;
@@ -116,6 +186,8 @@ interface RequestContext {
   authFailure?: string;
   /** The connection was upgraded to a WebSocket: the response is a 101 the gateway wrote itself. */
   switched?: boolean;
+  /** The trace this request belongs to (unless tracing is off). */
+  trace?: TraceContext;
 }
 
 /** What a WebSocket handshake attempt came to: a connection to join, or the upstream's own refusal to relay. */
@@ -127,12 +199,18 @@ interface StoreOptions {
   key: string;
   /** Freshness lifetime when the upstream gives no explicit directive. */
   ttlMs: number;
+  /** The route's stale windows, when the upstream gives none. */
+  stale: StaleDefaults;
   requestHeaders: IncomingHttpHeaders;
+  /** A stale entry still allowed to stand in for the upstream if it fails (stale-if-error). */
+  fallback?: CachedResponse;
 }
 
 interface RelayOutcome {
   /** The cache entry stored from this response, if any. */
   entry?: CachedResponse;
+  /** The upstream failed and this stale entry was served in its place. */
+  stale?: CachedResponse;
   /** The client went away before the response was fully delivered. */
   clientGone: boolean;
 }
@@ -141,6 +219,8 @@ interface RelayOutcome {
 type FlightResult =
   /** Stored: waiters can be served the entry. */
   | { kind: 'stored'; entry: CachedResponse }
+  /** The upstream failed and the stale entry stood in for it: waiters get the same. */
+  | { kind: 'stale'; entry: CachedResponse }
   /** Complete but not storable (it may be private to the leader's client), or the upstream failed mid-body. */
   | { kind: 'not-stored' }
   /** The leading client left before the response was complete, so there is nothing to share. */
@@ -221,27 +301,26 @@ const PROXY_HEADERS = [
 export class Gateway {
   readonly server: http.Server | https.Server;
   readonly metrics = new Registry();
-  readonly cache: ResponseCache;
   /** Where the admin listener is bound, once listen() has run (and the admin listener is enabled). */
   adminAddress?: AddressInfo;
 
-  private readonly router: Router;
-  private readonly upstreams = new Map<string, UpstreamRuntime>();
-  private readonly routeRules = new Map<string, RateLimitRuleConfig | undefined>();
+  /** The current configuration and everything built from it. Requests capture it when they start. */
+  private rt: Runtime;
+  private responseCache: ResponseCache;
+  /**
+   * One limiter per distinct (route, rule, store settings). It outlives reloads, so a rule a reload leaves alone
+   * keeps its counts (which matters when they are in memory); entries no configuration can reach any more are closed.
+   */
   private readonly limiterCache = new Map<string, RouteLimiter>();
-  private readonly ipCeiling?: RouteLimiter;
-  private readonly identities: IdentityResolver;
-  private readonly jwt?: JwtVerifier;
-  /** Rate-limit multiplier per JWT issuer name (from the issuer's plan). */
-  private readonly jwtMultiplier = new Map<string, number>();
+  /** Upstreams a reload replaced, kept until the calls still using their connections have finished. */
+  private readonly retiring = new Set<UpstreamRuntime>();
   private readonly logger: Logger;
   private readonly clock: Clock;
   private readonly redis?: Redis;
   private readonly startedAt: number;
-  private readonly allowedMethods: Set<string>;
-  private readonly maxConnectionsPerIp: number;
   private readonly admin: AdminListener;
   private readonly stopProcessMetrics: () => void;
+  private listening = false;
   private closing = false;
   /** Expiry of the certificate currently being served (TLS only). */
   private certNotAfter?: Date;
@@ -264,6 +343,14 @@ export class Gateway {
     'Rate-limit decisions made without the primary store.',
   );
   private readonly mCache = this.metrics.counter('gateway_cache_requests_total', 'Cache outcomes by route.');
+  private readonly mStaleServed = this.metrics.counter(
+    'gateway_cache_stale_served_total',
+    'Stale cache entries served, by route and why: revalidating (stale-while-revalidate) or upstream_error.',
+  );
+  private readonly mRefreshes = this.metrics.counter(
+    'gateway_cache_refreshes_total',
+    'Background refreshes of stale entries, by route and result.',
+  );
   private readonly mAttempts = this.metrics.counter(
     'gateway_upstream_attempts_total',
     'Upstream attempts by target and outcome.',
@@ -305,6 +392,10 @@ export class Gateway {
     'gateway_auth_total',
     'Authentication outcomes by route, method and result.',
   );
+  private readonly mReloads = this.metrics.counter(
+    'gateway_config_reloads_total',
+    'Configuration reloads, by result (ok, or error: the previous configuration stayed in force).',
+  );
   private readonly mLatency = this.metrics.histogram(
     'gateway_request_duration_seconds',
     'End-to-end request latency.',
@@ -312,73 +403,15 @@ export class Gateway {
   );
 
   constructor(
-    private readonly config: GatewayConfig,
+    config: GatewayConfig,
     private readonly deps: GatewayDeps = {},
   ) {
     this.logger = deps.logger ?? createLogger('info');
     this.clock = deps.clock ?? Date.now;
     this.redis = deps.redis;
     this.startedAt = this.clock();
-    this.allowedMethods = new Set(config.allowedMethods);
-    this.identities = new IdentityResolver(config.rateLimit);
-    if (config.auth.jwt) {
-      const issuers = config.auth.jwt.issuers.map((source) => {
-        try {
-          return loadIssuer(source, (path) => readFileSync(path, 'utf8'));
-        } catch (error) {
-          throw error instanceof JwtKeyError ? new ConfigError(error.message) : error;
-        }
-      });
-      this.jwt = new JwtVerifier(issuers, this.clock);
-      for (const issuer of issuers) {
-        this.jwtMultiplier.set(issuer.name, issuer.plan ? (config.rateLimit.plans[issuer.plan]?.multiplier ?? 1) : 1);
-      }
-    }
-    this.maxConnectionsPerIp = config.limits.maxConnectionsPerIp;
-
-    this.cache = new ResponseCache({ ...config.cache, clock: this.clock });
-    this.router = new Router(config.routes);
-
-    for (const [name, upstreamConfig] of Object.entries(config.upstreams)) {
-      const ca = upstreamConfig.tls ? readCaFile(`upstreams.${name}.tls.caFile`, upstreamConfig.tls.caFile) : undefined;
-      const urls = upstreamTargets(upstreamConfig);
-      const targets = urls.map((url, index): Target => {
-        const host = new URL(url).host;
-        // Two targets on one host:port (different base paths) still need distinct labels.
-        const id = urls.some((other, j) => j !== index && new URL(other).host === host) ? `${host}#${index}` : host;
-        return {
-          id,
-          pending: 0,
-          healthy: true,
-          client: new UpstreamClient(url, {
-            timeoutMs: upstreamConfig.timeoutMs,
-            maxConnections: upstreamConfig.maxConnections,
-            ca,
-          }),
-          breaker: new CircuitBreaker({
-            ...upstreamConfig.breaker,
-            clock: this.clock,
-            onStateChange: (from, to) => {
-              this.mTransitions.inc({ upstream: name, target: id, to });
-              this.logger.warn('circuit state change', { upstream: name, target: id, from, to });
-            },
-          }),
-        };
-      });
-      const runtime: UpstreamRuntime = { name, config: upstreamConfig, targets, cursor: 0 };
-      if (upstreamConfig.healthCheck) {
-        runtime.health = this.buildHealthCheck(runtime, upstreamConfig.healthCheck, ca);
-      }
-      this.upstreams.set(name, runtime);
-    }
-
-    for (const route of config.routes) {
-      const rule = route.rateLimit === undefined ? config.rateLimit.default : route.rateLimit || undefined;
-      this.routeRules.set(route.id ?? route.path, rule);
-    }
-    if (config.rateLimit.ip) {
-      this.ipCeiling = this.makeLimiter('client address', config.rateLimit.ip);
-    }
+    this.responseCache = new ResponseCache({ ...config.cache, clock: this.clock });
+    this.rt = this.buildRuntime(config, undefined, 1);
 
     this.registerGauges();
     this.stopProcessMetrics = registerProcessMetrics(this.metrics);
@@ -393,8 +426,8 @@ export class Gateway {
     const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
       void this.handle(req, res);
     };
-    if (config.tls) {
-      const material = this.readTlsMaterial(config.tls);
+    const material = this.rt.tls;
+    if (config.tls && material) {
       this.certNotAfter = material.notAfter;
       this.warnIfExpiring(material.notAfter);
       this.server = https.createServer(
@@ -416,10 +449,7 @@ export class Gateway {
     } else {
       this.server = http.createServer(serverOptions, onRequest);
     }
-    this.server.maxConnections = limits.maxConnections;
-    this.server.headersTimeout = limits.headersTimeoutMs;
-    this.server.requestTimeout = limits.requestTimeoutMs;
-    this.server.keepAliveTimeout = limits.keepAliveTimeoutMs;
+    this.applyServerLimits(limits);
     this.server.on('connection', (socket) => this.trackConnection(socket));
     this.server.on('upgrade', (req, socket, head) => {
       void this.handleUpgrade(req, socket, head);
@@ -431,6 +461,12 @@ export class Gateway {
         this.closing ? { status: 503, body: { status: 'draining' } } : { status: 200, body: { status: 'ready' } },
       health: () => this.healthReport(),
       metrics: () => this.renderMetrics(),
+      reload: deps.loadConfig
+        ? () => {
+            const result = this.reloadFromSource();
+            return { status: result.ok ? 200 : 422, body: result };
+          }
+        : undefined,
     });
   }
 
@@ -440,14 +476,11 @@ export class Gateway {
    * service: a botched renewal must not take the listener down.
    */
   reloadTls(): { ok: true; notAfter: Date } | { ok: false; reason: string } {
-    const tlsConfig = this.config.tls;
+    const tlsConfig = this.rt.config.tls;
     if (!tlsConfig || !(this.server instanceof https.Server)) return { ok: false, reason: 'TLS is not enabled' };
     try {
-      const material = this.readTlsMaterial(tlsConfig); // validates the pair before anything is swapped
-      this.server.setSecureContext({ cert: material.cert, key: material.key, passphrase: material.passphrase });
-      this.certNotAfter = material.notAfter;
-      this.logger.info('tls certificate reloaded', { notAfter: material.notAfter.toISOString() });
-      this.warnIfExpiring(material.notAfter);
+      const material = readTlsMaterial(tlsConfig); // validates the pair before anything is swapped
+      this.applyTls(tlsConfig, material);
       return { ok: true, notAfter: material.notAfter };
     } catch (error) {
       const reason = (error as Error).message;
@@ -456,21 +489,18 @@ export class Gateway {
     }
   }
 
-  private readTlsMaterial(tls: NonNullable<GatewayConfig['tls']>): {
-    cert: Buffer;
-    key: Buffer;
-    passphrase?: string;
-    notAfter: Date;
-  } {
-    const cert = readFileOrFail('tls.certFile', tls.certFile);
-    const key = readFileOrFail('tls.keyFile', tls.keyFile);
-    try {
-      // Builds a context from the pair, which fails for a mismatched key, a bad passphrase or garbage PEM.
-      createSecureContext({ cert, key, passphrase: tls.passphrase });
-    } catch (error) {
-      throw new ConfigError(`tls: the certificate and key are not a usable pair: ${(error as Error).message}`);
-    }
-    return { cert, key, passphrase: tls.passphrase, notAfter: new X509Certificate(cert).validToDate };
+  /** Serve new connections with this certificate, key and minimum version. Open connections keep what they had. */
+  private applyTls(tls: NonNullable<GatewayConfig['tls']>, material: TlsMaterial): void {
+    if (!(this.server instanceof https.Server)) return;
+    this.server.setSecureContext({
+      cert: material.cert,
+      key: material.key,
+      passphrase: material.passphrase,
+      minVersion: tls.minVersion,
+    });
+    this.certNotAfter = material.notAfter;
+    this.logger.info('tls certificate reloaded', { notAfter: material.notAfter.toISOString() });
+    this.warnIfExpiring(material.notAfter);
   }
 
   private warnIfExpiring(notAfter: Date): void {
@@ -484,9 +514,9 @@ export class Gateway {
     }
   }
 
-  async listen(port = this.config.port, host = this.config.host): Promise<AddressInfo> {
+  async listen(port = this.rt.config.port, host = this.rt.config.host): Promise<AddressInfo> {
     const main = await listenOn(this.server, port, host);
-    if (this.config.admin.enabled) {
+    if (this.rt.config.admin.enabled) {
       try {
         this.adminAddress = await this.admin.listen();
       } catch (error) {
@@ -494,20 +524,31 @@ export class Gateway {
         throw error;
       }
     }
+    this.listening = true;
     if (!this.deps.manualHealthChecks) {
-      for (const u of this.upstreams.values()) u.health?.checker.start();
+      for (const u of this.rt.upstreams.values()) u.health?.checker.start();
     }
     return main;
   }
 
+  /** The response cache (for tests and tooling). A reload that changes its size limits replaces it. */
+  get cache(): ResponseCache {
+    return this.responseCache;
+  }
+
+  /** The configuration in force. A reload replaces it; a request keeps the one it started with. */
+  get config(): GatewayConfig {
+    return this.rt.config;
+  }
+
   /** Probe every target of every upstream (or one) right now and wait. Mainly for tests and operator tooling. */
   async checkHealthNow(upstream?: string): Promise<void> {
-    const selected = upstream ? [this.upstreams.get(upstream)] : [...this.upstreams.values()];
+    const selected = upstream ? [this.rt.upstreams.get(upstream)] : [...this.rt.upstreams.values()];
     await Promise.all(selected.map((u) => u?.health?.checker.probeAll()));
   }
 
   /** Stop accepting connections, let in-flight requests finish (up to the grace period), then release resources. */
-  async close(graceMs = this.config.shutdownGraceMs): Promise<void> {
+  async close(graceMs = this.rt.config.shutdownGraceMs): Promise<void> {
     this.closing = true;
     // An upgraded socket is no longer tracked as an HTTP connection, yet it still holds server.close() open, and a
     // WebSocket has no response to wait for. End them now; their clients reconnect (to another instance, in a fleet).
@@ -528,33 +569,278 @@ export class Gateway {
     await this.admin.close();
     this.stopProcessMetrics();
 
-    for (const { targets, health } of this.upstreams.values()) {
-      health?.checker.stop();
-      for (const client of health?.clients.values() ?? []) client.close();
-      for (const target of targets) target.client.close();
-    }
-    const limiters = [...this.limiterCache.values(), ...(this.ipCeiling ? [this.ipCeiling] : [])];
-    await Promise.all(limiters.map(({ limiter }) => limiter.close?.()));
+    for (const upstream of new Set([...this.rt.upstreams.values(), ...this.retiring])) this.closeUpstream(upstream);
+    this.retiring.clear();
+    await Promise.all([...this.limiterCache.values()].map(({ limiter }) => limiter.close?.()));
   }
 
   /** Circuit breaker of an upstream's first target (the only one unless the upstream has several `urls`). */
   circuit(name: string): CircuitBreaker | undefined {
-    return this.upstreams.get(name)?.targets[0]?.breaker;
+    return this.rt.upstreams.get(name)?.targets[0]?.breaker;
   }
 
   /** Circuit breakers by target id. */
   circuits(name: string): Record<string, CircuitBreaker> {
     const out: Record<string, CircuitBreaker> = {};
-    for (const target of this.upstreams.get(name)?.targets ?? []) out[target.id] = target.breaker;
+    for (const target of this.rt.upstreams.get(name)?.targets ?? []) out[target.id] = target.breaker;
     return out;
+  }
+
+  private closeUpstream(upstream: UpstreamRuntime): void {
+    upstream.health?.checker.stop();
+    for (const client of upstream.health?.clients.values() ?? []) client.close();
+    for (const target of upstream.targets) target.client.close();
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------
+  // Reloading the configuration
+  // ------------------------------------------------------------------------------------------------------------------
+
+  /**
+   * Re-read the configuration from where it came from (the file, via `deps.loadConfig`) and apply it. What SIGHUP and
+   * the admin listener's reload endpoint do.
+   */
+  reloadFromSource(): ReloadResult {
+    const load = this.deps.loadConfig;
+    if (!load) return { ok: false, error: 'this gateway was not given a configuration source to reload from' };
+    let next: GatewayConfig;
+    try {
+      next = load();
+    } catch (error) {
+      return this.reloadFailed((error as Error).message);
+    }
+    return this.reload(next);
+  }
+
+  /**
+   * Apply a new configuration without dropping a connection. Everything it implies is built beside the configuration
+   * in force, and if any of it fails (an unreadable key file, a certificate that does not match its key) nothing
+   * changes. Requests already under way finish under the configuration they started with; new ones get the new one.
+   *
+   * A few settings cannot change in a running process: the listening address, whether it speaks TLS at all, the
+   * Redis connection, the admin listener's address, the cluster's size and the header size limit. They keep their
+   * old values, the rest of the reload goes ahead, and the result lists them under `restartRequired`.
+   */
+  reload(next: GatewayConfig): ReloadResult {
+    if (this.closing) return { ok: false, error: 'the gateway is shutting down' };
+    const previous = this.rt;
+    const { config, restartRequired } = keepFixed(previous.config, next);
+    let rt: Runtime;
+    try {
+      rt = this.buildRuntime(config, previous, previous.generation + 1);
+    } catch (error) {
+      return this.reloadFailed((error as Error).message);
+    }
+    const changed = changedSections(previous.config, config);
+
+    this.rt = rt;
+    this.applyRuntime(previous, rt);
+
+    this.mReloads.inc({ result: 'ok' });
+    this.logger.info('configuration reloaded', { generation: rt.generation, changed, restartRequired });
+    if (restartRequired.length > 0) {
+      this.logger.warn('these settings changed but need a restart to take effect', { settings: restartRequired });
+    }
+    return { ok: true, generation: rt.generation, changed, restartRequired };
+  }
+
+  private reloadFailed(error: string): ReloadResult {
+    this.mReloads.inc({ result: 'error' });
+    this.logger.error('configuration reload failed; still running the previous configuration', { error });
+    return { ok: false, error };
+  }
+
+  /** Bring everything outside the runtime in line with a runtime that has just been swapped in. */
+  private applyRuntime(previous: Runtime, rt: Runtime): void {
+    const { config } = rt;
+    this.applyServerLimits(config.limits);
+    this.admin.setToken(config.admin.token);
+    if (config.tls && rt.tls) this.applyTls(config.tls, rt.tls); // read and checked while building
+
+    // The cache: new size limits mean a new cache. Otherwise only entries from an upstream that changed or went
+    // are dropped; they may have come from a backend that is no longer the one configured.
+    if (!same(previous.config.cache, config.cache)) {
+      this.responseCache = new ResponseCache({ ...config.cache, clock: this.clock });
+    } else {
+      for (const [name, upstream] of previous.upstreams) {
+        if (rt.upstreams.get(name) !== upstream) {
+          this.responseCache.deleteWhere((key) => key.startsWith(`${name}\u0000`));
+        }
+      }
+    }
+
+    // Upstreams: a kept one carries on as it was; a new one starts its health checks; a replaced one is retired.
+    const kept = new Set(rt.upstreams.values());
+    const before = new Set(previous.upstreams.values());
+    for (const upstream of kept) {
+      if (!before.has(upstream) && this.listening && !this.deps.manualHealthChecks) upstream.health?.checker.start();
+    }
+    for (const upstream of before) {
+      if (!kept.has(upstream)) this.retire(upstream);
+    }
+
+    // Limiters that no route, plan or key override of the new configuration can reach.
+    const reachable = reachableLimiterKeys(config);
+    for (const [key, entry] of this.limiterCache) {
+      if (reachable.has(key)) continue;
+      this.limiterCache.delete(key);
+      void entry.limiter.close?.();
+    }
+  }
+
+  /**
+   * An upstream a reload replaced: no new calls go to it (they use the new runtime) and its health checks stop. Its
+   * connections close once the last call still using them has finished, so a response in flight is not cut off.
+   */
+  private retire(upstream: UpstreamRuntime): void {
+    upstream.retired = true;
+    upstream.health?.checker.stop();
+    if (upstream.users === 0) this.closeUpstream(upstream);
+    else this.retiring.add(upstream);
+  }
+
+  /** Run a call that uses an upstream's connections, so a reload knows when it may close them. */
+  private async withUpstream<T>(upstream: UpstreamRuntime, call: () => Promise<T>): Promise<T> {
+    upstream.users++;
+    try {
+      return await call();
+    } finally {
+      this.releaseUpstream(upstream);
+    }
+  }
+
+  /** The end of a call that held `upstream` (see {@link withUpstream}): the last one out of a retired one closes it. */
+  private releaseUpstream(upstream: UpstreamRuntime): void {
+    upstream.users--;
+    if (upstream.retired && upstream.users === 0 && this.retiring.delete(upstream)) this.closeUpstream(upstream);
   }
 
   // ------------------------------------------------------------------------------------------------------------------
   // Construction helpers
   // ------------------------------------------------------------------------------------------------------------------
 
-  private makeLimiter(label: string, rule: RateLimitRuleConfig): RouteLimiter {
-    const mode = this.config.rateLimit.failureMode;
+  /**
+   * Build everything a configuration implies. Whatever reads files or can be refused (JWT keys, certificates, CA
+   * bundles) is done first, so a configuration that cannot work is rejected before anything is built from it. An
+   * upstream whose definition and files are unchanged from `previous` is kept as it is, with its connections,
+   * circuit breakers and health-check state.
+   */
+  private buildRuntime(config: GatewayConfig, previous: Runtime | undefined, generation: number): Runtime {
+    const issuers = (config.auth.jwt?.issuers ?? []).map((source) => {
+      try {
+        return loadIssuer(source, (path) => readFileSync(path, 'utf8'));
+      } catch (error) {
+        throw error instanceof JwtKeyError ? new ConfigError(error.message) : error;
+      }
+    });
+    const upstreamTls = new Map(
+      Object.entries(config.upstreams).map(([name, upstream]) => [name, readUpstreamTls(name, upstream)] as const),
+    );
+    const tls = config.tls ? readTlsMaterial(config.tls) : undefined;
+
+    const upstreams = new Map<string, UpstreamRuntime>();
+    for (const [name, upstreamConfig] of Object.entries(config.upstreams)) {
+      const material = upstreamTls.get(name);
+      const fingerprint = upstreamFingerprint(upstreamConfig, material);
+      const kept = previous?.upstreams.get(name);
+      upstreams.set(
+        name,
+        kept && kept.fingerprint === fingerprint
+          ? kept
+          : this.buildUpstream(name, upstreamConfig, material, fingerprint),
+      );
+    }
+
+    const routeRules = new Map<string, RateLimitRuleConfig | undefined>();
+    for (const route of config.routes) {
+      const rule = route.rateLimit === undefined ? config.rateLimit.default : route.rateLimit || undefined;
+      routeRules.set(route.id ?? route.path, rule);
+    }
+    const routePolicies = new Map<string, RoutePolicy>();
+    for (const route of config.routes) {
+      const upstream = config.upstreams[route.upstream] as UpstreamConfig;
+      routePolicies.set(route.id ?? route.path, {
+        timeoutMs: route.timeoutMs ?? upstream.timeoutMs,
+        totalTimeoutMs: route.totalTimeoutMs ?? upstream.totalTimeoutMs,
+        retry: { ...upstream.retry, ...definedOnly(route.retry ?? {}) },
+        maxBodyBytes: route.maxBodyBytes ?? config.maxBodyBytes,
+      });
+    }
+    const jwtMultiplier = new Map<string, number>();
+    for (const issuer of issuers) {
+      jwtMultiplier.set(issuer.name, issuer.plan ? (config.rateLimit.plans[issuer.plan]?.multiplier ?? 1) : 1);
+    }
+
+    return {
+      generation,
+      config,
+      router: new Router(config.routes),
+      upstreams,
+      routeRules,
+      routePolicies,
+      identities: new IdentityResolver(config.rateLimit),
+      jwt: issuers.length > 0 ? new JwtVerifier(issuers, this.clock) : undefined,
+      jwtMultiplier,
+      allowedMethods: new Set(config.allowedMethods),
+      ipCeiling: config.rateLimit.ip ? this.limiterFor(config, IP_CEILING, config.rateLimit.ip) : undefined,
+      tls,
+    };
+  }
+
+  private buildUpstream(
+    name: string,
+    upstreamConfig: UpstreamConfig,
+    material: UpstreamTlsMaterial | undefined,
+    fingerprint: string,
+  ): UpstreamRuntime {
+    const urls = upstreamTargets(upstreamConfig);
+    const targets = urls.map((url, index): Target => {
+      const host = new URL(url).host;
+      // Two targets on one host:port (different base paths) still need distinct labels.
+      const id = urls.some((other, j) => j !== index && new URL(other).host === host) ? `${host}#${index}` : host;
+      return {
+        id,
+        pending: 0,
+        healthy: true,
+        client: new UpstreamClient(url, {
+          timeoutMs: upstreamConfig.timeoutMs,
+          maxConnections: upstreamConfig.maxConnections,
+          ...material,
+        }),
+        breaker: new CircuitBreaker({
+          ...upstreamConfig.breaker,
+          clock: this.clock,
+          onStateChange: (from, to) => {
+            this.mTransitions.inc({ upstream: name, target: id, to });
+            this.logger.warn('circuit state change', { upstream: name, target: id, from, to });
+          },
+        }),
+      };
+    });
+    const runtime: UpstreamRuntime = {
+      name,
+      config: upstreamConfig,
+      targets,
+      cursor: 0,
+      fingerprint,
+      users: 0,
+      retired: false,
+    };
+    if (upstreamConfig.healthCheck) {
+      runtime.health = this.buildHealthCheck(runtime, upstreamConfig.healthCheck, material);
+    }
+    return runtime;
+  }
+
+  private applyServerLimits(limits: GatewayConfig['limits']): void {
+    this.server.maxConnections = limits.maxConnections;
+    this.server.headersTimeout = limits.headersTimeoutMs;
+    this.server.requestTimeout = limits.requestTimeoutMs;
+    this.server.keepAliveTimeout = limits.keepAliveTimeoutMs;
+  }
+
+  private makeLimiter(label: string, rule: RateLimitRuleConfig, config: GatewayConfig): RouteLimiter {
+    const mode = config.rateLimit.failureMode;
     const makeLocal = (): RateLimiter => {
       switch (rule.algorithm) {
         case 'token-bucket':
@@ -571,7 +857,7 @@ export class Gateway {
     const tag = algorithmTag(rule);
     if (!this.redis) return { limiter: makeLocal(), tag };
 
-    const keyPrefix = this.config.redis?.keyPrefix ?? 'gw:';
+    const keyPrefix = config.redis?.keyPrefix ?? 'gw:';
     let primary: RateLimiter;
     let limit: number;
     switch (rule.algorithm) {
@@ -610,23 +896,26 @@ export class Gateway {
     };
   }
 
-  /** One limiter per distinct (route, rule), created on first use. Rules come only from config, so this is bounded. */
-  private limiterFor(routeId: string, rule: RateLimitRuleConfig): RouteLimiter {
-    const cacheKey = `${routeId}\u0000${ruleFingerprint(rule)}`;
+  /**
+   * One limiter per distinct (route, rule, store settings), created on first use. Rules come only from config, so
+   * this is bounded; see {@link reachableLimiterKeys} for how a reload trims it.
+   */
+  private limiterFor(config: GatewayConfig, routeId: string, rule: RateLimitRuleConfig): RouteLimiter {
+    const cacheKey = limiterKey(config, routeId, rule);
     let entry = this.limiterCache.get(cacheKey);
     if (!entry) {
-      entry = this.makeLimiter(`route ${routeId}`, rule);
+      entry = this.makeLimiter(routeId === IP_CEILING ? 'client address' : `route ${routeId}`, rule, config);
       this.limiterCache.set(cacheKey, entry);
     }
     return entry;
   }
 
   /** The rule that governs this caller on this route, or undefined if they are unlimited there. */
-  private effectiveRule(routeId: string, identity: Identity): RateLimitRuleConfig | undefined {
+  private effectiveRule(rt: Runtime, routeId: string, identity: Identity): RateLimitRuleConfig | undefined {
     const override = identity.overrides?.[routeId];
     if (override === false) return undefined;
     if (override) return override;
-    const base = this.routeRules.get(routeId);
+    const base = rt.routeRules.get(routeId);
     return base ? scaleRule(base, identity.multiplier) : undefined;
   }
 
@@ -634,14 +923,14 @@ export class Gateway {
   private buildHealthCheck(
     upstream: UpstreamRuntime,
     hc: NonNullable<UpstreamConfig['healthCheck']>,
-    ca: Buffer | undefined,
+    material: UpstreamTlsMaterial | undefined,
   ): NonNullable<UpstreamRuntime['health']> {
     const clients = new Map<string, UpstreamClient>();
     const urls = upstreamTargets(upstream.config);
     upstream.targets.forEach((target, index) => {
       clients.set(
         target.id,
-        new UpstreamClient(urls[index] as string, { timeoutMs: hc.timeoutMs, maxConnections: 2, ca }),
+        new UpstreamClient(urls[index] as string, { timeoutMs: hc.timeoutMs, maxConnections: 2, ...material }),
       );
     });
     const byId = new Map(upstream.targets.map((t) => [t.id, t]));
@@ -655,9 +944,12 @@ export class Gateway {
         unhealthyThreshold: hc.unhealthyThreshold,
         healthyThreshold: hc.healthyThreshold,
         probe: (id) => this.probe(clients.get(id) as UpstreamClient, hc, expected, extraHeaders),
-        onResult: (id, result) =>
-          this.mHealthChecks.inc({ upstream: upstream.name, target: id, result: result.ok ? 'ok' : 'fail' }),
+        onResult: (id, result) => {
+          if (upstream.retired) return; // a probe that was under way when a reload replaced this upstream
+          this.mHealthChecks.inc({ upstream: upstream.name, target: id, result: result.ok ? 'ok' : 'fail' });
+        },
         onChange: (id, healthy, reason) => {
+          if (upstream.retired) return;
           const target = byId.get(id);
           if (target) {
             target.healthy = healthy;
@@ -706,7 +998,7 @@ export class Gateway {
       'gateway_circuit_state',
       'Circuit breaker state per upstream target (0 closed, 1 half-open, 2 open).',
       () =>
-        [...this.upstreams.values()].flatMap((u) =>
+        [...this.rt.upstreams.values()].flatMap((u) =>
           u.targets.map((t) => ({
             labels: { upstream: u.name, target: t.id },
             value: CIRCUIT_VALUE[t.breaker.state],
@@ -717,7 +1009,7 @@ export class Gateway {
       'gateway_target_healthy',
       'Active health-check verdict per target (1 healthy, 0 unhealthy). Only upstreams with a health check.',
       () =>
-        [...this.upstreams.values()]
+        [...this.rt.upstreams.values()]
           .filter((u) => u.health)
           .flatMap((u) =>
             u.targets.map((t) => ({ labels: { upstream: u.name, target: t.id }, value: t.healthy ? 1 : 0 })),
@@ -734,6 +1026,9 @@ export class Gateway {
     this.metrics.gauge('gateway_websocket_connections', 'WebSocket connections open or being opened, per route.', () =>
       [...this.wsOpen].map(([route, value]) => ({ labels: { route }, value })),
     );
+    this.metrics.gauge('gateway_config_generation', 'Configurations applied: 1 at start-up, +1 per reload.', () => [
+      { labels: {}, value: this.rt.generation },
+    ]);
     this.metrics.gauge('gateway_cache_entries', 'Entries held in the response cache.', () => [
       { labels: {}, value: this.cache.stats().entries },
     ]);
@@ -757,9 +1052,10 @@ export class Gateway {
       this.connections--;
     });
 
-    const max = this.maxConnectionsPerIp;
+    const { limits, rateLimit } = this.rt.config;
+    const max = limits.maxConnectionsPerIp;
     if (max === 0) return;
-    const ip = normalizeIp(socket.remoteAddress, this.config.rateLimit.ipv6Prefix) ?? 'unknown';
+    const ip = normalizeIp(socket.remoteAddress, rateLimit.ipv6Prefix) ?? 'unknown';
     const count = (this.connectionsByIp.get(ip) ?? 0) + 1;
     if (count > max) {
       this.mConnRejected.inc({ reason: 'per_ip' });
@@ -779,7 +1075,10 @@ export class Gateway {
   // ------------------------------------------------------------------------------------------------------------------
 
   private newContext(req: IncomingMessage): RequestContext {
+    const { tracing } = this.rt.config;
     return {
+      rt: this.rt,
+      trace: tracing.enabled ? startOrContinue(req.headers, tracing) : undefined,
       requestId: sanitizeRequestId(req.headers['x-request-id']) ?? randomUUID(),
       method: req.method ?? 'GET',
       path: '',
@@ -797,9 +1096,8 @@ export class Gateway {
   /** The headers every response carries, and the bookkeeping that runs when the response (or its connection) ends. */
   private trackResponse(res: ServerResponse, ctx: RequestContext): void {
     res.setHeader('x-request-id', ctx.requestId);
-    if (this.config.tls?.hstsMaxAgeSeconds) {
-      res.setHeader('strict-transport-security', `max-age=${this.config.tls.hstsMaxAgeSeconds}`);
-    }
+    const hsts = ctx.rt.config.tls?.hstsMaxAgeSeconds;
+    if (hsts) res.setHeader('strict-transport-security', `max-age=${hsts}`);
     if (this.closing) res.setHeader('connection', 'close');
 
     this.active.add(res);
@@ -813,7 +1111,7 @@ export class Gateway {
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const ctx = this.newContext(req);
-    const shed = this.active.size >= this.config.limits.maxInFlight;
+    const shed = this.active.size >= ctx.rt.config.limits.maxInFlight;
     this.trackResponse(res, ctx);
 
     try {
@@ -825,9 +1123,9 @@ export class Gateway {
   }
 
   private async dispatch(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): Promise<void> {
-    if (!this.allowedMethods.has(ctx.method)) {
+    if (!ctx.rt.allowedMethods.has(ctx.method)) {
       return this.sendError(res, ctx, 405, 'method_not_allowed', 'method not allowed', {
-        allow: [...this.allowedMethods].join(', '),
+        allow: [...ctx.rt.allowedMethods].join(', '),
       });
     }
 
@@ -847,14 +1145,15 @@ export class Gateway {
       return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
     }
 
-    const match = this.router.match(url.pathname, ctx.method);
+    const match = ctx.rt.router.match(url.pathname, ctx.method);
     if (!match) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
     ctx.route = match.routeId;
 
     if (!(await this.admitted(req, res, ctx, match.route, match.routeId))) return;
 
-    const body = await this.readBody(req, ctx);
-    const upstream = this.upstreams.get(match.route.upstream) as UpstreamRuntime;
+    const policy = ctx.rt.routePolicies.get(match.routeId) as RoutePolicy;
+    const body = await this.readBody(req, ctx, policy.maxBodyBytes);
+    const upstream = ctx.rt.upstreams.get(match.route.upstream) as UpstreamRuntime;
     ctx.upstream = upstream.name;
     const relativePath = match.upstreamPath + url.search;
 
@@ -863,14 +1162,14 @@ export class Gateway {
       const info = requestCacheInfo(req.headers);
       const keyed = [...new Set([...cacheConfig.varyHeaders, ...cacheConfig.forwardHeaders])];
       if (!info.noStore && requestIsCacheSafe(req.headers, keyed)) {
-        await this.cachedGet(req, res, ctx, match.route, upstream, relativePath, url, keyed, info.noCache);
+        await this.cachedGet(req, res, ctx, match.route, upstream, policy, relativePath, url, keyed, info.noCache);
         return;
       }
       ctx.cache = 'BYPASS';
       res.setHeader('x-cache', 'BYPASS');
     }
 
-    await this.forward(req, res, ctx, upstream, relativePath, body);
+    await this.forward(req, res, ctx, upstream, policy, relativePath, body);
   }
 
   /** Authentication and rate limiting. Returns false if the request was rejected (response already sent). */
@@ -881,8 +1180,9 @@ export class Gateway {
     route: RouteConfig,
     routeId: string,
   ): Promise<boolean> {
-    const ip = this.clientIp(req);
-    const header = req.headers[this.config.rateLimit.identityHeader];
+    const { rt } = ctx;
+    const ip = this.clientIp(req, rt);
+    const header = req.headers[rt.config.rateLimit.identityHeader];
     const presented = Array.isArray(header) ? header[0] : header;
 
     // The address ceiling comes first, before any credential is looked at. It is what bounds a client that rotates
@@ -890,14 +1190,14 @@ export class Gateway {
     // authentication, so a flood of guessed keys or bad tokens (each costing a lookup or a signature check) is
     // turned away for the price of one counter update.
     let decision: RateLimitDecision | undefined;
-    if (this.ipCeiling) {
-      decision = await this.ipCeiling.limiter.consume(`rlip:${this.ipCeiling.tag}:${ip}`);
+    if (rt.ipCeiling) {
+      decision = await rt.ipCeiling.limiter.consume(`rlip:${rt.ipCeiling.tag}:${ip}`);
       if (!decision.allowed) return this.reject(res, ctx, routeId, decision);
     }
 
     let identity: Identity;
     if (route.auth) {
-      const outcome = this.authenticate(req, route.auth, presented || undefined, ip);
+      const outcome = this.authenticate(req, rt, route.auth, presented || undefined, ip);
       this.mAuth.inc({ route: routeId, method: outcome.method, result: outcome.ok ? 'ok' : 'fail' });
       if (!outcome.ok) {
         ctx.authFailure = outcome.reason;
@@ -912,7 +1212,7 @@ export class Gateway {
         ctx.auth = { method: outcome.method as 'api-key' | 'jwt', client: outcome.client, issuer: outcome.issuer };
       }
     } else {
-      const resolved = this.identities.resolve(presented || undefined, ip);
+      const resolved = rt.identities.resolve(presented || undefined, ip);
       if (!resolved.ok) {
         this.mUnauthorized.inc({ route: routeId });
         this.sendError(res, ctx, 401, 'unauthorized', 'a valid API key is required', { 'www-authenticate': 'ApiKey' });
@@ -922,9 +1222,9 @@ export class Gateway {
     }
     ctx.client = identity.name;
 
-    const rule = this.effectiveRule(routeId, identity);
+    const rule = this.effectiveRule(rt, routeId, identity);
     if (rule) {
-      const { limiter, tag } = this.limiterFor(routeId, rule);
+      const { limiter, tag } = this.limiterFor(rt.config, routeId, rule);
       // A caller scaled down (anonymous multiplier, a small override) may have less than the route costs: charge
       // their whole allowance rather than an amount no request could ever pay.
       const cost = Math.min(route.cost, ruleAllowance(rule));
@@ -955,6 +1255,7 @@ export class Gateway {
    */
   private authenticate(
     req: IncomingMessage,
+    rt: Runtime,
     auth: NonNullable<RouteConfig['auth']>,
     presentedKey: string | undefined,
     ip: string,
@@ -971,10 +1272,10 @@ export class Gateway {
         .filter(Boolean)
         .join(', ');
 
-    if (wantsJwt && this.jwt) {
+    if (wantsJwt && rt.jwt) {
       const token = bearerToken(req.headers.authorization);
       if (token !== undefined) {
-        const result = this.jwt.verify(token);
+        const result = rt.jwt.verify(token);
         if (!result.ok) return { ok: false, method: 'jwt', reason: result.reason, challenge: challenge(true) };
         return {
           ok: true,
@@ -982,13 +1283,13 @@ export class Gateway {
           authenticated: true,
           client: result.subject,
           issuer: result.issuer.name,
-          identity: this.jwtIdentity(result.issuer, result.subject),
+          identity: this.jwtIdentity(rt, result.issuer, result.subject),
         };
       }
     }
 
     if (wantsKey && presentedKey !== undefined) {
-      const identity = this.identities.lookupRegistered(presentedKey);
+      const identity = rt.identities.lookupRegistered(presentedKey);
       if (!identity) return { ok: false, method: 'api-key', reason: 'unknown_api_key', challenge: challenge(false) };
       return { ok: true, method: 'api-key', authenticated: true, client: identity.name ?? '', identity };
     }
@@ -996,20 +1297,20 @@ export class Gateway {
     if (auth.required) return { ok: false, method: 'none', reason: 'missing_credentials', challenge: challenge(false) };
 
     // Optional authentication and nothing presented: an ordinary anonymous caller, limited like any other.
-    const anonymous = this.identities.resolve(presentedKey, ip);
+    const anonymous = rt.identities.resolve(presentedKey, ip);
     const identity: Identity = anonymous.ok
       ? anonymous.identity
-      : { id: `ip:${ip}`, kind: 'anonymous', multiplier: this.config.rateLimit.anonymousMultiplier };
+      : { id: `ip:${ip}`, kind: 'anonymous', multiplier: rt.config.rateLimit.anonymousMultiplier };
     return { ok: true, method: 'none', authenticated: false, client: '', identity };
   }
 
-  private jwtIdentity(issuer: JwtIssuer, subject: string): Identity {
+  private jwtIdentity(rt: Runtime, issuer: JwtIssuer, subject: string): Identity {
     const digest = createHash('sha256').update(`${issuer.name}\u0000${subject}`).digest('hex');
     return {
       id: `j:${digest.slice(0, 32)}`,
       kind: 'key',
       name: `${issuer.name}:${subject}`.slice(0, 128),
-      multiplier: this.jwtMultiplier.get(issuer.name) ?? 1,
+      multiplier: rt.jwtMultiplier.get(issuer.name) ?? 1,
       authMethod: 'jwt',
     };
   }
@@ -1027,8 +1328,8 @@ export class Gateway {
    * outermost trusted proxy appended to X-Forwarded-For; anything that doesn't parse as an address falls back
    * to the socket, so attacker-chosen text is never used as a key.
    */
-  private clientIp(req: IncomingMessage): string {
-    const { trustedProxyHops: hops, ipv6Prefix } = this.config.rateLimit;
+  private clientIp(req: IncomingMessage, rt: Runtime): string {
+    const { trustedProxyHops: hops, ipv6Prefix } = rt.config.rateLimit;
     if (hops > 0) {
       const raw = req.headers['x-forwarded-for'];
       const parts = (Array.isArray(raw) ? raw.join(',') : (raw ?? ''))
@@ -1051,6 +1352,7 @@ export class Gateway {
     ctx: RequestContext,
     route: RouteConfig,
     upstream: UpstreamRuntime,
+    policy: RoutePolicy,
     relativePath: string,
     url: URL,
     keyedHeaders: string[],
@@ -1059,25 +1361,60 @@ export class Gateway {
     const cacheConfig = route.cache as NonNullable<RouteConfig['cache']>;
     const varied = keyedHeaders.map((h) => String(req.headers[h] ?? '')).join('\u0000');
     const key = `${upstream.name}\u0000${url.pathname}${url.search}\u0000${varied}`;
+    const store: StoreOptions = {
+      key,
+      ttlMs: cacheConfig.ttlMs,
+      stale: { whileRevalidateMs: cacheConfig.staleWhileRevalidateMs, ifErrorMs: cacheConfig.staleIfErrorMs },
+      requestHeaders: req.headers,
+    };
 
+    // A client that asked for a fresh copy (no-cache) gets one, or the error: neither a hit nor a stale stand-in.
     if (!skipLookup) {
-      const hit = this.cache.get(key, req.headers);
-      if (hit) {
-        await this.serveEntry(res, ctx, hit);
+      const found = this.responseCache.lookup(key, req.headers);
+      if (found?.fresh) {
+        await this.serveEntry(res, ctx, found.entry, 'HIT');
         return;
+      }
+      if (found) {
+        const now = this.clock();
+        if (now < (found.entry.staleWhileRevalidateUntil ?? 0)) {
+          // Stale, but inside its stale-while-revalidate window: answer at once and fetch a fresh copy behind it.
+          this.refreshInBackground(req, ctx, upstream, policy, relativePath, store, keyedHeaders);
+          this.mStaleServed.inc({ route: ctx.route, reason: 'revalidating' });
+          await this.serveEntry(res, ctx, found.entry, 'STALE');
+          return;
+        }
+        // Past that window, but still allowed to stand in for the upstream if it fails.
+        if (now < (found.entry.staleIfErrorUntil ?? 0)) store.fallback = found.entry;
       }
     }
 
-    const store: StoreOptions = { key, ttlMs: cacheConfig.ttlMs, requestHeaders: req.headers };
     const fetchAndStore = async (): Promise<FlightResult> => {
       ctx.cache = 'MISS';
       res.setHeader('x-cache', 'MISS');
       try {
-        const outcome = await this.forward(req, res, ctx, upstream, relativePath, undefined, store, keyedHeaders);
+        const outcome = await this.forward(
+          req,
+          res,
+          ctx,
+          upstream,
+          policy,
+          relativePath,
+          undefined,
+          store,
+          keyedHeaders,
+        );
+        if (outcome.stale) return { kind: 'stale', entry: outcome.stale };
         if (outcome.entry) return { kind: 'stored', entry: outcome.entry };
         return outcome.clientGone ? { kind: 'abandoned' } : { kind: 'not-stored' };
       } catch (error) {
         if (error instanceof UpstreamError && error.kind === 'aborted') return { kind: 'abandoned' };
+        if (store.fallback && isUpstreamFailure(error)) {
+          // The upstream failed (after its retries); the stale copy it allowed for exactly this is the better answer.
+          this.servedStaleFor(ctx, error);
+          await this.serveEntry(res, ctx, store.fallback, 'STALE');
+          return { kind: 'stale', entry: store.fallback };
+        }
         throw error; // shared with every waiter: a failing upstream gets one request, not one per waiter
       }
     };
@@ -1086,14 +1423,24 @@ export class Gateway {
     // own client while storing it; the rest wait for the stored entry (or the shared error).
     for (;;) {
       let led = false;
-      const { value } = await this.cache.singleFlight(key, () => {
-        led = true;
-        return fetchAndStore();
-      });
+      let value: FlightResult;
+      try {
+        ({ value } = await this.responseCache.singleFlight(key, () => {
+          led = true;
+          return fetchAndStore();
+        }));
+      } catch (error) {
+        // Waiting on someone else's fetch (a background refresh, say) that failed: our own stale copy may cover it.
+        if (led || ctx.clientGone || !store.fallback || !isUpstreamFailure(error)) throw error;
+        this.servedStaleFor(ctx, error);
+        await this.serveEntry(res, ctx, store.fallback, 'STALE');
+        return;
+      }
       if (led || ctx.clientGone) return;
 
-      if (value.kind === 'stored') {
-        await this.serveEntry(res, ctx, value.entry);
+      if (value.kind === 'stored' || value.kind === 'stale') {
+        if (value.kind === 'stale') this.mStaleServed.inc({ route: ctx.route, reason: 'upstream_error' });
+        await this.serveEntry(res, ctx, value.entry, value.kind === 'stored' ? 'HIT' : 'STALE');
         return;
       }
       if (value.kind === 'not-stored') {
@@ -1106,10 +1453,163 @@ export class Gateway {
     }
   }
 
-  private async serveEntry(res: ServerResponse, ctx: RequestContext, entry: CachedResponse): Promise<void> {
-    ctx.cache = 'HIT';
+  /** Count and log a stale entry standing in for an upstream that failed. */
+  private servedStaleFor(ctx: RequestContext, cause: unknown): void {
+    this.mStaleServed.inc({ route: ctx.route, reason: 'upstream_error' });
+    this.logger.warn('upstream failed; serving a stale copy', {
+      requestId: ctx.requestId,
+      route: ctx.route,
+      upstream: ctx.upstream,
+      cause:
+        typeof cause === 'string'
+          ? cause
+          : cause instanceof UpstreamError
+            ? cause.kind
+            : cause instanceof CircuitOpenError
+              ? 'circuit_open'
+              : 'error',
+    });
+  }
+
+  /**
+   * Fetch a fresh copy of a stale entry while the stale one goes on being served. One fetch per key at a time; if it
+   * fails, the stale copy stays in service until its windows close.
+   */
+  private refreshInBackground(
+    req: IncomingMessage,
+    ctx: RequestContext,
+    upstream: UpstreamRuntime,
+    policy: RoutePolicy,
+    relativePath: string,
+    store: StoreOptions,
+    keyedHeaders: string[],
+  ): void {
+    if (this.responseCache.isInFlight(store.key)) return;
+    const bg = this.backgroundContext(ctx);
+    // Built now, from the request that set it off: by the time the fetch runs, that request may be long gone.
+    const headers = this.upstreamHeaders(req, bg, undefined, true, keyedHeaders);
+    void this.responseCache
+      .singleFlight(store.key, () => this.fetchIntoCache(bg, upstream, policy, relativePath, headers, store))
+      .then(
+        ({ value }) => this.finishRefresh(bg, value.kind === 'stored' ? 'stored' : 'not_stored'),
+        (error: unknown) => this.finishRefresh(bg, 'error', error),
+      );
+  }
+
+  /** A context for work a request sets off but does not wait for: same route and caller, its own id, same trace. */
+  private backgroundContext(ctx: RequestContext): RequestContext {
+    return {
+      rt: ctx.rt,
+      trace: ctx.trace ? childOf(ctx.trace) : undefined,
+      requestId: randomUUID(),
+      method: 'GET',
+      path: ctx.path,
+      route: ctx.route,
+      upstream: ctx.upstream,
+      client: ctx.client,
+      auth: ctx.auth,
+      attempts: 0,
+      rateLimited: false,
+      degraded: false,
+      started: performance.now(),
+      clientGone: false,
+      upstreamTruncated: false,
+      buffered: 0,
+    };
+  }
+
+  private async fetchIntoCache(
+    bg: RequestContext,
+    upstream: UpstreamRuntime,
+    policy: RoutePolicy,
+    relativePath: string,
+    headers: Record<string, string | string[]>,
+    store: StoreOptions,
+  ): Promise<FlightResult> {
+    return this.withUpstream(upstream, () =>
+      this.fetchIntoCacheFrom(bg, upstream, policy, relativePath, headers, store),
+    );
+  }
+
+  private async fetchIntoCacheFrom(
+    bg: RequestContext,
+    upstream: UpstreamRuntime,
+    policy: RoutePolicy,
+    relativePath: string,
+    headers: Record<string, string | string[]>,
+    store: StoreOptions,
+  ): Promise<FlightResult> {
+    const response = await this.callUpstream<UpstreamResponse>(upstream, bg, policy, NEVER_ABORTED, {
+      send: (target, timeoutMs) =>
+        target.client.request({
+          method: 'GET',
+          path: target.client.resolvePath(relativePath),
+          headers: { ...headers, host: target.client.host },
+          timeoutMs,
+        }),
+      status: (result) => result.status,
+      headers: (result) => result.headers,
+      discard: (result) => result.stream.resume(),
+    });
+    const entry = await this.readIntoCache(response, store);
+    return entry ? { kind: 'stored', entry } : { kind: 'not-stored' };
+  }
+
+  /** Read a response with nobody waiting on it, and store it if it may be stored. */
+  private async readIntoCache(up: UpstreamResponse, store: StoreOptions): Promise<CachedResponse | undefined> {
+    const decision = storeDecision(up.status, up.headers, store.ttlMs, store.stale);
+    const max = this.responseCache.maxEntryBytes;
+    const declared = Number(up.headers['content-length']);
+    if (!decision) {
+      up.stream.resume();
+      return undefined;
+    }
+    if (Number.isFinite(declared) && declared > max) {
+      up.stream.destroy();
+      return undefined;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of up.stream as AsyncIterable<Buffer>) {
+      size += chunk.length;
+      if (size > max) {
+        up.stream.destroy();
+        return undefined;
+      }
+      chunks.push(chunk);
+    }
+    if (Number.isFinite(declared) && declared !== size) return undefined; // truncated
+    return this.storeEntry(store, up, decision, Buffer.concat(chunks));
+  }
+
+  private finishRefresh(bg: RequestContext, result: 'stored' | 'not_stored' | 'error', error?: unknown): void {
+    this.mRefreshes.inc({ route: bg.route, result });
+    const fields = {
+      requestId: bg.requestId,
+      route: bg.route,
+      result,
+      attempts: bg.attempts,
+      durationMs: Math.round(performance.now() - bg.started),
+    };
+    if (result !== 'error') {
+      this.logger.debug('cache entry refreshed in the background', fields);
+      return;
+    }
+    this.logger.warn('background cache refresh failed; the stale copy stays in service', {
+      ...fields,
+      cause: error instanceof UpstreamError ? error.kind : error instanceof CircuitOpenError ? 'circuit_open' : 'error',
+    });
+  }
+
+  private async serveEntry(
+    res: ServerResponse,
+    ctx: RequestContext,
+    entry: CachedResponse,
+    as: 'HIT' | 'STALE',
+  ): Promise<void> {
+    ctx.cache = as;
     const age = Math.max(0, Math.floor((this.clock() - entry.storedAt) / 1000));
-    res.writeHead(entry.status, { ...entry.headers, age: String(age), 'x-cache': 'HIT' });
+    res.writeHead(entry.status, { ...entry.headers, age: String(age), 'x-cache': as });
     const body = entry.body;
     if (body.length <= WRITE_SLICE_BYTES) {
       res.end(body); // fits in the socket's buffers whatever the client does, so there is nothing to wait for
@@ -1129,13 +1629,14 @@ export class Gateway {
    * than `limits.responseStallTimeoutMs` (in which case it is dropped here).
    */
   private async drained(res: ServerResponse, ctx: RequestContext): Promise<boolean> {
-    const outcome = await waitForDrain(res, this.config.limits.responseStallTimeoutMs);
+    const stallMs = ctx.rt.config.limits.responseStallTimeoutMs;
+    const outcome = await waitForDrain(res, stallMs);
     if (outcome === 'stalled') {
       this.mShed.inc({ reason: 'slow_reader' });
       this.logger.warn('dropping a client that stopped reading its response', {
         requestId: ctx.requestId,
         route: ctx.route,
-        stalledMs: this.config.limits.responseStallTimeoutMs,
+        stalledMs: stallMs,
       });
       res.destroy();
     }
@@ -1177,6 +1678,7 @@ export class Gateway {
     res: ServerResponse,
     ctx: RequestContext,
     upstream: UpstreamRuntime,
+    policy: RoutePolicy,
     relativePath: string,
     body: Buffer | undefined,
     store?: StoreOptions,
@@ -1191,8 +1693,9 @@ export class Gateway {
 
     const headers = this.upstreamHeaders(req, ctx, body, store !== undefined, forwardOnly);
 
+    upstream.users++;
     try {
-      const response = await this.callUpstream<UpstreamResponse>(upstream, ctx, abort.signal, {
+      const response = await this.callUpstream<UpstreamResponse>(upstream, ctx, policy, abort.signal, {
         send: (target, timeoutMs) =>
           target.client.request({
             method: ctx.method,
@@ -1206,9 +1709,17 @@ export class Gateway {
         headers: (result) => result.headers,
         discard: (result) => result.stream.resume(),
       });
+      if (store?.fallback && response.status >= 500) {
+        // Retries are spent and the upstream is still failing; it allowed this stale copy to stand in for it.
+        response.stream.resume();
+        this.servedStaleFor(ctx, `status ${response.status}`);
+        await this.serveEntry(res, ctx, store.fallback, 'STALE');
+        return { clientGone: false, stale: store.fallback };
+      }
       return await this.relay(res, ctx, response, store);
     } finally {
       res.off('close', onClose);
+      this.releaseUpstream(upstream);
     }
   }
 
@@ -1221,6 +1732,7 @@ export class Gateway {
   private async callUpstream<T>(
     upstream: UpstreamRuntime,
     ctx: RequestContext,
+    policy: RoutePolicy,
     signal: AbortSignal,
     call: {
       /** A single attempt against `target`, to finish within `timeoutMs`. */
@@ -1231,13 +1743,12 @@ export class Gateway {
       discard(result: T): void;
     },
   ): Promise<T> {
-    const { retry: policy } = upstream.config;
-    const retryStatuses = new Set(policy.retryOnStatus);
-    const mayRetryUnsafe = IDEMPOTENT.has(ctx.method) || policy.retryNonIdempotent;
+    const { retry: retryPolicy, timeoutMs, totalTimeoutMs } = policy;
+    const retryStatuses = new Set(retryPolicy.retryOnStatus);
+    const mayRetryUnsafe = IDEMPOTENT.has(ctx.method) || retryPolicy.retryNonIdempotent;
     const tried = new Set<Target>();
 
     // Overall deadline across attempts and backoff sleeps (real time: it bounds how long a client waits).
-    const { totalTimeoutMs } = upstream.config;
     const deadline = totalTimeoutMs === undefined ? undefined : performance.now() + totalTimeoutMs;
     const budgetLeftMs = (): number => (deadline === undefined ? Infinity : deadline - performance.now());
 
@@ -1254,7 +1765,7 @@ export class Gateway {
         ctx.attempts++;
         target.pending++;
         try {
-          const result = await call.send(target, Math.max(1, Math.min(upstream.config.timeoutMs, budgetLeftMs())));
+          const result = await call.send(target, Math.max(1, Math.min(timeoutMs, budgetLeftMs())));
           const failed = call.status(result) >= 500;
           if (failed) permit.failure();
           else permit.success();
@@ -1275,8 +1786,8 @@ export class Gateway {
         }
       },
       {
-        maxAttempts: policy.maxAttempts,
-        backoff: { baseDelayMs: policy.baseDelayMs, maxDelayMs: policy.maxDelayMs },
+        maxAttempts: retryPolicy.maxAttempts,
+        backoff: { baseDelayMs: retryPolicy.baseDelayMs, maxDelayMs: retryPolicy.maxDelayMs },
         signal,
         sleep: this.deps.sleep,
         random: this.deps.random,
@@ -1334,7 +1845,7 @@ export class Gateway {
     // object, exactly as Node does for a normal request. A successful upgrade detaches it again.
     const res = new ServerResponse(req);
     res.assignSocket(socket as Socket);
-    const shed = this.active.size >= this.config.limits.maxInFlight;
+    const shed = this.active.size >= ctx.rt.config.limits.maxInFlight;
     this.trackResponse(res, ctx);
     res.setHeader('connection', 'close'); // this socket never goes back to the HTTP parser
     res.once('finish', () => closeSoon(socket));
@@ -1360,6 +1871,7 @@ export class Gateway {
 
     let routeId: string | undefined;
     let tunneled = false;
+    let held: UpstreamRuntime | undefined; // whose connections the handshake is using
     try {
       if (this.closing) {
         return this.sendError(res, ctx, 503, 'shutting_down', 'the gateway is shutting down', { 'retry-after': 1 });
@@ -1377,7 +1889,7 @@ export class Gateway {
         return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
       }
 
-      const match = this.router.match(url.pathname, 'GET');
+      const match = ctx.rt.router.match(url.pathname, 'GET');
       const ws = match?.route.websocket;
       if (!match || !ws) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
       ctx.route = match.routeId;
@@ -1410,12 +1922,15 @@ export class Gateway {
       this.wsOpen.set(match.routeId, open + 1);
       routeId = match.routeId;
 
-      const upstream = this.upstreams.get(match.route.upstream) as UpstreamRuntime;
+      const upstream = ctx.rt.upstreams.get(match.route.upstream) as UpstreamRuntime;
       ctx.upstream = upstream.name;
       const relativePath = match.upstreamPath + url.search;
       const headers = this.websocketHeaders(req, ctx, handshake);
 
-      const result = await this.callUpstream<UpgradeResult>(upstream, ctx, abort.signal, {
+      const policy = ctx.rt.routePolicies.get(match.routeId) as RoutePolicy;
+      held = upstream;
+      upstream.users++;
+      const result = await this.callUpstream<UpgradeResult>(upstream, ctx, policy, abort.signal, {
         send: async (target, timeoutMs) => {
           const outcome = await target.client.upgrade({
             path: target.client.resolvePath(relativePath),
@@ -1507,6 +2022,7 @@ export class Gateway {
       this.fail(res, ctx, error);
     } finally {
       if (routeId !== undefined && !tunneled) this.releaseWebsocketSlot(routeId);
+      if (held) this.releaseUpstream(held); // a joined tunnel's socket has left the pool; it is not affected
     }
   }
 
@@ -1572,8 +2088,9 @@ export class Gateway {
     }
     for (const name of REWRITE_HEADERS) delete headers[name];
 
+    const { config } = ctx.rt;
     const remote = (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-    if (this.config.rateLimit.trustedProxyHops > 0) {
+    if (config.rateLimit.trustedProxyHops > 0) {
       // Behind trusted proxies: they own the chain, we add the hop we actually saw.
       const prior = req.headers['x-forwarded-for'];
       headers['x-forwarded-for'] = [Array.isArray(prior) ? prior.join(', ') : prior, remote].filter(Boolean).join(', ');
@@ -1586,23 +2103,29 @@ export class Gateway {
       headers['x-forwarded-for'] = remote;
       // What this listener actually is. (Behind trusted proxies the proxy's own claim is kept instead.)
       headers['x-forwarded-proto'] = (req.socket as TLSSocket).encrypted ? 'https' : 'http';
-      if (this.config.forwardedHost) headers['x-forwarded-host'] = this.config.forwardedHost;
+      if (config.forwardedHost) headers['x-forwarded-host'] = config.forwardedHost;
     }
     headers['x-request-id'] = ctx.requestId;
+    if (ctx.trace) {
+      // Our hop as the parent. A caller's tracestate belongs to the caller's trace: it goes only where that continues.
+      headers['traceparent'] = formatTraceparent(ctx.trace);
+      if (ctx.trace.state) headers['tracestate'] = ctx.trace.state;
+      else delete headers['tracestate'];
+    }
 
     // Identity headers are the gateway's word about who the caller is, so a client must never be able to supply
     // them: strip whatever came in, then set them only from a credential the gateway verified itself.
     for (const name of IDENTITY_HEADERS) delete headers[name];
     if (ctx.auth) {
-      if (this.config.auth.forwardIdentity) {
+      if (config.auth.forwardIdentity) {
         headers['x-authenticated-method'] = ctx.auth.method;
         headers['x-authenticated-client'] = headerSafe(ctx.auth.client);
         if (ctx.auth.issuer) headers['x-authenticated-issuer'] = headerSafe(ctx.auth.issuer);
       }
-      if (!this.config.auth.forwardCredentials) {
+      if (!config.auth.forwardCredentials) {
         // Only the credential the gateway consumed: other schemes in Authorization are the upstream's business.
         if (ctx.auth.method === 'jwt') delete headers['authorization'];
-        else delete headers[this.config.rateLimit.identityHeader];
+        else delete headers[config.rateLimit.identityHeader];
       }
     }
 
@@ -1623,7 +2146,7 @@ export class Gateway {
     store?: StoreOptions,
   ): Promise<RelayOutcome> {
     const maxEntry = this.cache.maxEntryBytes;
-    const decision = store ? storeDecision(up.status, up.headers, store.ttlMs) : undefined;
+    const decision = store ? storeDecision(up.status, up.headers, store.ttlMs, store.stale) : undefined;
     const declared = Number(up.headers['content-length']);
     let collecting = decision !== undefined && !(Number.isFinite(declared) && declared > maxEntry);
     const chunks: Buffer[] = [];
@@ -1675,7 +2198,16 @@ export class Gateway {
     if (!collecting || !decision || !store) return { clientGone: false };
     if (Number.isFinite(declared) && declared !== size) return { clientGone: false }; // truncated
 
-    const body = Buffer.concat(chunks);
+    return { entry: this.storeEntry(store, up, decision, Buffer.concat(chunks)), clientGone: false };
+  }
+
+  /** Turn a complete response into a cache entry, with its freshness and stale windows, and store it. */
+  private storeEntry(
+    store: StoreOptions,
+    up: UpstreamResponse,
+    decision: StoreDecision,
+    body: Buffer,
+  ): CachedResponse | undefined {
     const entryHeaders = stripHopByHop(up.headers);
     delete entryHeaders['age']; // our own Age header is computed at serve time
     entryHeaders['content-length'] = String(body.length);
@@ -1688,15 +2220,19 @@ export class Gateway {
       vary[name] = Array.isArray(value) ? value.join(', ') : value;
     }
     const now = this.clock();
+    const expiresAt = now + decision.ttlMs;
     const entry: CachedResponse = {
       status: up.status,
       headers: entryHeaders,
       body,
       storedAt: now,
-      expiresAt: now + decision.ttlMs,
+      expiresAt,
+      staleWhileRevalidateUntil:
+        decision.staleWhileRevalidateMs > 0 ? expiresAt + decision.staleWhileRevalidateMs : undefined,
+      staleIfErrorUntil: decision.staleIfErrorMs > 0 ? expiresAt + decision.staleIfErrorMs : undefined,
       vary,
     };
-    return { entry: this.cache.set(store.key, entry) ? entry : undefined, clientGone: false };
+    return this.responseCache.set(store.key, entry) ? entry : undefined;
   }
 
   /**
@@ -1704,9 +2240,8 @@ export class Gateway {
    * Content-Length. Uses events rather than `for await`: breaking out of an async iterator destroys the
    * request, and with it the socket, before the 413 could be written.
    */
-  private readBody(req: IncomingMessage, ctx: RequestContext): Promise<Buffer | undefined> {
-    const limit = this.config.maxBodyBytes;
-    const budget = this.config.limits.maxBufferedBytes;
+  private readBody(req: IncomingMessage, ctx: RequestContext, limit: number): Promise<Buffer | undefined> {
+    const budget = ctx.rt.config.limits.maxBufferedBytes;
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > limit) return Promise.reject(new PayloadTooLargeError(limit));
     if (Number.isFinite(declared) && this.bufferedBytes + declared > budget) {
@@ -1842,7 +2377,7 @@ export class Gateway {
   /** The state the health endpoint reports: circuit and health-check state per target, load, cache. */
   healthReport(): Record<string, unknown> {
     const upstreams: Record<string, unknown> = {};
-    for (const u of this.upstreams.values()) {
+    for (const u of this.rt.upstreams.values()) {
       const targets = u.targets.map((t) => ({
         id: t.id,
         pending: t.pending,
@@ -1862,6 +2397,7 @@ export class Gateway {
     return {
       status: 'ok',
       uptimeSeconds: Math.floor((this.clock() - this.startedAt) / 1000),
+      configGeneration: this.rt.generation,
       redis: this.redis ? this.redis.status : 'disabled',
       connections: this.connections,
       inFlight: this.active.size,
@@ -1884,6 +2420,7 @@ export class Gateway {
     if (ctx.cache) this.mCache.inc({ route: ctx.route, result: ctx.cache });
     this.logger.info('request', {
       requestId: ctx.requestId,
+      traceId: ctx.trace?.traceId,
       method: ctx.method,
       // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
       path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path,
@@ -1939,12 +2476,77 @@ function readFileOrFail(setting: string, path: string): Buffer {
   }
 }
 
-function readCaFile(setting: string, path: string): Buffer {
+/** Read the listener's certificate and key, and check they are a usable pair, before anything is swapped. */
+function readTlsMaterial(tls: NonNullable<GatewayConfig['tls']>): TlsMaterial {
+  const cert = readFileOrFail('tls.certFile', tls.certFile);
+  const key = readFileOrFail('tls.keyFile', tls.keyFile);
   try {
-    return readFileSync(path);
+    // Builds a context from the pair, which fails for a mismatched key, a bad passphrase or garbage PEM.
+    createSecureContext({ cert, key, passphrase: tls.passphrase });
   } catch (error) {
-    throw new ConfigError(`${setting}: cannot read "${path}": ${(error as Error).message}`);
+    throw new ConfigError(`tls: the certificate and key are not a usable pair: ${(error as Error).message}`);
   }
+  return { cert, key, passphrase: tls.passphrase, notAfter: new X509Certificate(cert).validToDate };
+}
+
+/** What an upstream's TLS settings point at, read once per configuration. */
+interface UpstreamTlsMaterial {
+  ca?: Buffer;
+  /** The client certificate presented for mutual TLS, with its key. */
+  cert?: Buffer;
+  key?: Buffer;
+  passphrase?: string;
+}
+
+function readUpstreamTls(name: string, upstream: UpstreamConfig): UpstreamTlsMaterial | undefined {
+  const tls = upstream.tls;
+  if (!tls) return undefined;
+  const material: UpstreamTlsMaterial = {};
+  if (tls.caFile) material.ca = readFileOrFail(`upstreams.${name}.tls.caFile`, tls.caFile);
+  if (tls.certFile && tls.keyFile) {
+    const cert = readFileOrFail(`upstreams.${name}.tls.certFile`, tls.certFile);
+    const key = readFileOrFail(`upstreams.${name}.tls.keyFile`, tls.keyFile);
+    try {
+      // Fails for a key that does not match, a wrong or missing passphrase, or something that is not PEM at all.
+      createSecureContext({ cert, key, passphrase: tls.passphrase });
+    } catch (error) {
+      throw new ConfigError(
+        `upstreams.${name}.tls: the client certificate and key are not a usable pair: ${(error as Error).message}`,
+      );
+    }
+    Object.assign(material, { cert, key, passphrase: tls.passphrase });
+  }
+  return material;
+}
+
+/** An upstream's definition plus the contents of the files it uses: equal fingerprints mean nothing changed. */
+function upstreamFingerprint(upstream: UpstreamConfig, material: UpstreamTlsMaterial | undefined): string {
+  const hash = createHash('sha256').update(JSON.stringify(upstream));
+  for (const value of Object.values(material ?? {})) {
+    if (value !== undefined) hash.update('\u0000').update(value);
+  }
+  return hash.digest('hex');
+}
+
+/** A failure of the upstream itself (as opposed to the client leaving), which a stale-if-error entry may cover. */
+function isUpstreamFailure(error: unknown): boolean {
+  return error instanceof CircuitOpenError || (error instanceof UpstreamError && error.kind !== 'aborted');
+}
+
+/** For calls nobody can cancel: a background refresh is bounded by its route's timeouts instead. */
+const NEVER_ABORTED = new AbortController().signal;
+
+/** The entries of `obj` that are set: optional settings a route leaves out must not erase its upstream's. */
+function definedOnly<T extends object>(obj: T): Partial<T> {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
+
+/** The route id the per-address ceiling's limiter is filed under (a real route id is never empty). */
+const IP_CEILING = '';
+
+/** What identifies a limiter: its route, its rule, and the store settings it was built with. */
+function limiterKey(config: GatewayConfig, routeId: string, rule: RateLimitRuleConfig): string {
+  return [routeId, ruleFingerprint(rule), config.rateLimit.failureMode, config.redis?.keyPrefix ?? ''].join('\u0000');
 }
 
 /** `Retry-After` is either delta-seconds or an HTTP date. Returns ms, or undefined if absent/unparseable. */
@@ -1954,4 +2556,67 @@ export function parseRetryAfterMs(value: string | string[] | undefined, now = Da
   if (/^\d+$/.test(raw.trim())) return Number(raw) * 1000;
   const at = Date.parse(raw);
   return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+/** Deep equality for configuration values (plain JSON data, in schema order). */
+function same(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Settings a running process cannot change: a reload keeps the values in force (and says which ones it kept), so the
+ * runtime describes what is actually happening rather than what the file wishes.
+ */
+function keepFixed(current: GatewayConfig, next: GatewayConfig): { config: GatewayConfig; restartRequired: string[] } {
+  const restartRequired: string[] = [];
+  const config: GatewayConfig = { ...next };
+  for (const key of ['port', 'host', 'redis', 'cluster'] as const) {
+    if (!same(current[key], next[key])) {
+      restartRequired.push(key);
+      Object.assign(config, { [key]: current[key] });
+    }
+  }
+  // The certificate, key, minimum version and HSTS can change; whether the listener speaks TLS at all cannot.
+  if ((current.tls === undefined) !== (next.tls === undefined)) {
+    restartRequired.push('tls');
+    config.tls = current.tls;
+  }
+  // The admin listener is bound once; its token can change.
+  const { admin } = current;
+  if (admin.enabled !== next.admin.enabled || admin.host !== next.admin.host || admin.port !== next.admin.port) {
+    restartRequired.push('admin');
+    config.admin = { ...next.admin, enabled: admin.enabled, host: admin.host, port: admin.port };
+  }
+  if (current.limits.maxHeaderBytes !== next.limits.maxHeaderBytes) {
+    restartRequired.push('limits.maxHeaderBytes');
+    config.limits = { ...next.limits, maxHeaderBytes: current.limits.maxHeaderBytes };
+  }
+  return { config, restartRequired };
+}
+
+/** The top-level sections that differ between two configurations, for the reload log. */
+function changedSections(before: GatewayConfig, after: GatewayConfig): string[] {
+  return (Object.keys(after) as Array<keyof GatewayConfig>).filter((key) => !same(before[key], after[key]));
+}
+
+/**
+ * Every limiter a configuration can reach: each route's rule under every multiplier a caller can have (1, the
+ * anonymous multiplier, each plan's), each key's per-route overrides, and the per-address ceiling. Anything else in
+ * the limiter cache belongs to a configuration that is gone.
+ */
+function reachableLimiterKeys(config: GatewayConfig): Set<string> {
+  const rl = config.rateLimit;
+  const multipliers = new Set([1, rl.anonymousMultiplier, ...Object.values(rl.plans).map((plan) => plan.multiplier)]);
+  const keys = new Set<string>();
+  for (const route of config.routes) {
+    const routeId = route.id ?? route.path;
+    const base = route.rateLimit === undefined ? rl.default : route.rateLimit || undefined;
+    if (base) for (const multiplier of multipliers) keys.add(limiterKey(config, routeId, scaleRule(base, multiplier)));
+    for (const key of rl.apiKeys) {
+      const override = key.overrides?.[routeId];
+      if (override) keys.add(limiterKey(config, routeId, override));
+    }
+  }
+  if (rl.ip) keys.add(limiterKey(config, IP_CEILING, rl.ip));
+  return keys;
 }

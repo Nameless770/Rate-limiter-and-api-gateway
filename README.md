@@ -5,12 +5,17 @@ A small API gateway that sits in front of other HTTP services and handles the cr
 - **Per-key rate limiting** with a token bucket, an exact sliding window or an approximate (O(1)-memory) sliding-window counter, implemented from scratch and backed by Redis so the limit is shared by every gateway instance
 - **API keys with plans**, per-key overrides, and a per-address ceiling so rotating key values doesn't buy a fresh budget
 - **Authentication per route**: registered API keys and signed JWTs (HS256 / RS256 / ES256), verified by the gateway, with a trusted identity passed to the upstream
-- **Routing** by path prefix, with prefix stripping and per-route policy
-- **Response caching** with HTTP-correct freshness rules, stampede protection and a defence against cache poisoning
+- **Routing** by path prefix, with prefix stripping and per-route timeouts, retries, body limits, rate limits and caching
+- **Response caching** with HTTP-correct freshness rules, stampede protection, a defence against cache poisoning, and stale copies served while revalidating or while the upstream is failing
 - **Load balancing** across several targets per upstream, each with its own circuit breaker
 - **Retries** with exponential backoff and full jitter
 - **Circuit breaking** per target, so a failing instance gets room to recover and callers fail fast
 - **Active health checks**, so traffic avoids a down target before any client request has to fail to find out
+- **TLS** facing clients (renewals picked up without a restart) and towards upstreams (private CAs, client certificates)
+- **WebSocket proxying** with origin checks, authentication and connection limits
+- **Cluster mode** to use every core of a machine, with the rate limits still shared through Redis
+- **Configuration reloads** without a restart or a dropped request, all or nothing
+- **Trace context**: a W3C `traceparent` on every forwarded request, and the trace id in the access log
 
 Written in TypeScript on Node's built-in `http`. The only runtime dependencies are `ioredis` (the Redis client) and `zod` (config validation). The rate limiters, circuit breaker, retry loop, balancer and cache are hand-written.
 
@@ -44,6 +49,7 @@ node demo/hammer.mjs http://localhost:8080/slow --n 20               # ...and wa
 curl localhost:9001/_demo/failure?rate=0                             # heal it; the breaker probes and closes
 curl localhost:9090/_gateway/health                                  # circuit state per upstream target
 curl localhost:9090/_gateway/metrics                                 # Prometheus text format
+curl -X POST localhost:9090/_gateway/reload                          # apply edits to gateway.config.json, no restart
 ```
 
 With Redis, and two gateway instances sharing one budget:
@@ -148,6 +154,21 @@ Only `GET`, only `200`, and only when it's safe to share:
   - If the leading client disconnects mid-fetch, one waiter takes over as the new leader, rather than all of them hitting the upstream at once.
 - LRU eviction with a byte budget; entries over `maxEntryBytes` are streamed but not stored
 
+### Serving stale
+
+An entry past its freshness lifetime can still be useful, in the two cases RFC 5861 defines:
+
+- **While revalidating** (`stale-while-revalidate`): the client gets the stale copy at once (`X-Cache: STALE`, with its `Age`), and one background request fetches a fresh copy for whoever comes next. However many requests arrive meanwhile, the upstream sees one refresh; if it fails, the stale copy stays in service until its window closes.
+- **Instead of an error** (`stale-if-error`): when fetching a fresh copy fails (a 5xx once the route's retries are spent, a timeout, a refused connection, an open circuit), the stale copy is served in place of the error, to every request coalesced on that fetch.
+
+The upstream decides with its `Cache-Control` (`max-age=60, stale-while-revalidate=30, stale-if-error=86400`). A route can set windows for upstreams that say nothing:
+
+```json
+"cache": { "ttlMs": 60000, "staleWhileRevalidateMs": 30000, "staleIfErrorMs": 86400000 }
+```
+
+Both default to `0`: nothing is served stale unless someone asked for it. A stale copy is never served against `must-revalidate` or `proxy-revalidate`, a route's windows don't apply over `s-maxage` (which carries `proxy-revalidate`'s meaning for a shared cache), and a client that sends `Cache-Control: no-cache` gets a fresh copy or the error. `gateway_cache_stale_served_total{reason}` (`revalidating` or `upstream_error`) and `gateway_cache_refreshes_total{result}` show it at work.
+
 ### Cache poisoning
 
 Many frameworks build absolute links or error pages from headers like `X-Forwarded-Host`. If the gateway forwarded whatever a client sent and cached the result, one request could plant an attacker's value in a response every later client receives. So on a cacheable fetch:
@@ -165,6 +186,18 @@ Many frameworks build absolute links or error pages from headers like `X-Forward
 - `Retry-After` is honoured as a floor; a hint longer than `maxDelayMs` means "stop retrying"
 - `totalTimeoutMs` bounds the whole exchange, so a request can't take `attempts x timeout`
 - When retries are exhausted the upstream's last response is returned unchanged
+
+**Per route.** One upstream often serves a lookup that should take 200 ms and an export that takes 30 s, and no single timeout suits both. A route can set its own `timeoutMs` and `totalTimeoutMs`, change any of its upstream's `retry` settings (the rest are inherited; `{ "maxAttempts": 1 }` turns retries off), and take bodies larger than the global `maxBodyBytes`:
+
+```json
+"routes": [
+  { "path": "/users", "upstream": "users" },
+  { "path": "/users/export", "upstream": "users", "timeoutMs": 30000, "retry": { "maxAttempts": 1 } },
+  { "path": "/users/avatars", "upstream": "users", "maxBodyBytes": 10485760 }
+]
+```
+
+Bodies are held in memory against `limits.maxBufferedBytes`, so a body limit larger than that budget could never be met; start-up says so in a `config` log line.
 
 **Load balancing.** An upstream may list several interchangeable backends:
 
@@ -266,6 +299,9 @@ What the gateway defends, and how. Everything here has a test; the table points 
 | Information disclosure in errors | Generic client-facing errors with a request id; detail logged against that id | `gateway.security.test.ts` |
 | Unsafe methods | Allowlist (default excludes `TRACE`/`CONNECT`) with `405` + `Allow` | `gateway.security.test.ts` |
 | Plaintext Redis, secrets in config | `rediss://` + private CA support; startup notes when Redis is plaintext to a non-loopback host; keys held as digests | `config.security.test.ts` |
+| A web page making a browser reconfigure the gateway (`POST 127.0.0.1:9090/_gateway/reload`) | Reload is `POST` only, behind the admin token, and refused when the request carries a browser's `Origin` or `Sec-Fetch-Site` | `gateway.reload.test.ts` |
+| A broken file taking the gateway down on reload | Reloads are all or nothing: the whole configuration and every file it names are checked before anything is swapped | `gateway.reload.test.ts`, `reload.e2e.test.ts` |
+| Clients steering or flooding your traces | Strict `traceparent` validation; `tracestate` length-capped and forwarded only with its own trace; `trustIncoming: false` at an untrusted edge | `trace.test.ts`, `gateway.trace.test.ts` |
 
 Startup prints a `security` log line for each risky-but-legal setting (header-keyed limits with no registry or ceiling, plaintext Redis off-box, a cache with no `varyHeaders`, an admin listener bound off loopback).
 
@@ -280,12 +316,23 @@ The proxy listener can terminate TLS itself, so the gateway can face clients dir
 ```
 
 - **TLS 1.2 or 1.3 only.** `minVersion` can raise the floor to 1.3; TLS 1.0 and 1.1 cannot be configured at all.
-- **Renewals without a restart.** `kill -HUP <pid>` (POSIX) re-reads the files and uses the new certificate for new connections; open connections keep the old one until they close. The new pair is validated *before* anything is swapped, so a half-finished renewal (a new certificate with the old key, a truncated file, a missing file) is logged as an error and **the previous certificate stays in service**.
+- **Renewals without a restart.** A configuration reload (`kill -HUP <pid>` on POSIX, or `POST /_gateway/reload`; see "Reloading without a restart") re-reads the files and uses the new certificate for new connections; open connections keep the old one until they close. The new pair is validated *before* anything is swapped, so a half-finished renewal (a new certificate with the old key, a truncated file, a missing file) is logged as an error and **the previous certificate stays in service**. `minVersion` and `hstsMaxAgeSeconds` change the same way; turning TLS on or off takes a restart.
 - **Bad material fails fast at startup**, naming the setting: a missing file, a key that doesn't match the certificate, a wrong or missing passphrase (`passphrase` takes `${ENV_VAR}`). Errors never contain key material.
 - **Handshake timeout.** A client that connects and never completes the TLS handshake is dropped after `limits.headersTimeoutMs`, not Node's default two minutes. Failed handshakes are counted by cause in `gateway_tls_handshake_failures_total`.
 - **Expiry is visible.** `gateway_tls_certificate_expiry_seconds` goes negative when the certificate has lapsed (alert on it); the gateway logs a warning under 14 days and an error once expired, at startup and on every reload.
 - **`X-Forwarded-Proto`** tells the upstream the truth: `https` for clients on this listener. `hstsMaxAgeSeconds` adds `Strict-Transport-Security`; leave it unset until you are certain every client can use HTTPS.
 - The admin listener stays plain HTTP on loopback; its bearer token is not meant to cross a network.
+
+**Towards upstreams.** An `https://` upstream is verified against Node's default CAs, or only against `tls.caFile` for one signed by a private CA; there is deliberately no option to skip verification. For an upstream that only accepts callers it can identify, the gateway presents a client certificate (mutual TLS):
+
+```json
+"payments": {
+  "url": "https://payments.internal:8443",
+  "tls": { "caFile": "/etc/gateway/internal-ca.pem", "certFile": "/etc/gateway/client.pem", "keyFile": "/etc/gateway/client-key.pem" }
+}
+```
+
+It is presented on every connection to that upstream, health probes included. The pair is checked like the listener's, at start-up and on every reload (a key that doesn't match, a wrong passphrase or an unreadable file is refused, naming the setting), and a reload after the files change moves the upstream onto the new certificate.
 
 ## WebSockets
 
@@ -337,7 +384,7 @@ The entrypoint then becomes a **primary** that runs no gateway of its own and st
 - **Workers are kept alive.** A worker that dies is replaced after 0.5 s, and the wait doubles (up to 30 s) while it keeps dying young, so a crash loop cannot spin the machine. If a worker cannot start at all (three attempts), start-up is abandoned and the process exits 1 where a deploy will see it. Workers also exit if the primary goes away.
 - **The admin listener lives in the primary and speaks for all workers.** `/_gateway/metrics` has every worker's series under a `worker` label (counters are not pre-summed; use `sum without (worker) (...)`) plus the primary's own (`worker="primary"`: `gateway_cluster_workers`, `gateway_cluster_worker_ready{slot}`, `gateway_cluster_worker_restarts_total{slot}` and its process metrics). `/_gateway/health` has a `cluster` summary and each worker's full report, and says `degraded` if one does not answer. `/_gateway/live` is 200 while at least one worker is ready. The token applies as before. Log lines from workers carry a `worker` field.
 - **Some state is per worker, and should be sized for one worker:** the response cache (so N copies, and a lower hit rate), circuit breakers and active health checks (each worker probes each target), and the `limits` (connections, in-flight requests, buffered bytes) and WebSocket `maxConnections`.
-- **Shutdown and reloads.** `SIGTERM`/`SIGINT` to the primary has every worker finish its in-flight requests (up to `shutdownGraceMs`), and it exits 0 once they are gone. `SIGHUP` reloads the TLS certificate in every worker (POSIX; each validates before swapping, as in "TLS").
+- **Shutdown and reloads.** `SIGTERM`/`SIGINT` to the primary has every worker finish its in-flight requests (up to `shutdownGraceMs`), and it exits 0 once they are gone. `SIGHUP` to the primary (POSIX), or `POST /_gateway/reload`, reloads the configuration in every worker: the primary checks the file first, then each worker applies it all or nothing, and the answer lists how each one fared (see "Reloading without a restart").
 
 Measured on the machine described under "Performance" (Linux container, Redis limiter, 128 connections, median of 3):
 
@@ -361,10 +408,13 @@ Scaling is near-linear to two workers, then limited by the machine rather than t
 | Every upstream connection busy | Waiting for a free connection to an upstream (`upstreams.*.maxConnections`) counts against the attempt timeout like connecting does, so a saturated upstream gives callers a 504 on time instead of leaving them queued behind other requests. |
 | Client stops reading its response | A client that accepts none of a response for `limits.responseStallTimeoutMs` (30 s) is dropped (`gateway_requests_shed_total{reason="slow_reader"}`, status 499 in the log), freeing the upstream connection. A client that is merely slow keeps its connection: the clock restarts whenever it takes data. The same holds for large cached entries, which are written in slices. If the dropped client was the one fetching a cache entry, the clients coalesced behind it wait at most that long before one of them takes over. |
 | Shutdown (`SIGTERM` / `SIGINT`) | The listener closes and idle keep-alive connections drop at once. In-flight requests finish, with `Connection: close`. Each connection closes as soon as its response completes, and anything still running after `shutdownGraceMs` is cut off. |
+| Configuration reloaded mid-request | The request finishes under the configuration it started with (route, upstream, timeouts, limits). An upstream the reload replaced closes its connections only once its last request has finished. |
 
 ## Configuration
 
-See [`gateway.config.json`](gateway.config.json) for a working example. The schema is strict: unknown keys are errors, so a typo fails at startup instead of being ignored, and cross-references (unknown plan, unknown route id, duplicate key, `requireKey` with no keys, an exposed admin listener with no token) are validated too. String values support `${VAR}` and `${VAR:-default}`; `PORT` and `REDIS_URL` override the file.
+See [`gateway.config.json`](gateway.config.json) for a working example. The schema is strict: unknown keys are errors, so a typo fails at startup instead of being ignored, and cross-references (unknown plan, unknown route id, duplicate key, `requireKey` with no keys, an exposed admin listener with no token) are validated too. String values support `${VAR}` and `${VAR:-default}`; `PORT`, `ADMIN_PORT`, `REDIS_URL` and `WORKERS` override the file.
+
+To try a configuration before deploying it, `node dist/index.js gateway.config.json --check` checks it and every file it names (certificates and keys, CA bundles, JWT keys), prints the warnings start-up would print, and exits 0 if the gateway would start or 1 if not, without binding a port or contacting anything. `--help` lists the options.
 
 | Section | Key | Default | Meaning |
 |---|---|---|---|
@@ -373,7 +423,7 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | root | `shutdownGraceMs` | `10000` | How long in-flight requests get to finish on shutdown |
 | root | `allowedMethods` | `GET HEAD POST PUT PATCH DELETE OPTIONS` | Anything else gets 405 |
 | root | `forwardedHost` | unset | The `X-Forwarded-Host` sent upstream when the gateway is the edge |
-| `admin` | `enabled`, `host`, `port`, `token` | `true`, `127.0.0.1`, `9090`, unset | Health/metrics listener. A non-loopback `host` requires a `token` (16+ chars) |
+| `admin` | `enabled`, `host`, `port`, `token` | `true`, `127.0.0.1`, `9090`, unset | Health, metrics and reload listener. A non-loopback `host` requires a `token` (16+ chars) |
 | `cluster` | `workers` | `1` | Worker processes (a number, or `"auto"` for one per core; `WORKERS` overrides). More than one requires `redis`; see "Scaling across cores" |
 | `tls` | `certFile`, `keyFile`, `passphrase`, `minVersion`, `hstsMaxAgeSeconds` | off; `TLSv1.2`; unset | Terminate TLS on the proxy listener (see "TLS") |
 | `redis` | `url`, `keyPrefix`, `commandTimeoutMs`, `caFile` | `-`, `gw:`, `100`, unset | Omit the section for in-memory limiting. `rediss://` for TLS; `caFile` for a private CA |
@@ -389,15 +439,37 @@ See [`gateway.config.json`](gateway.config.json) for a working example. The sche
 | `limits` | `maxInFlight`, `maxBufferedBytes` | `2000`, 64 MiB | Load shedding (503) |
 | `limits` | `maxHeaderBytes`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs` | `16384`, `15000`, `60000`, `65000` | Protocol limits |
 | `limits` | `responseStallTimeoutMs` | `30000` | Drop a client that has taken none of its response for this long (see "Behaviour at the edges") |
+| `tracing` | `enabled`, `trustIncoming` | `true`, `true` | W3C trace context (see "Observability"). `trustIncoming: false` starts a new trace for every request, for an edge facing clients you don't trust |
 | `upstreams.*` | `url` **or** `urls`, `balance` | `-`, `round-robin` | One backend, or several |
 | `upstreams.*` | `timeoutMs`, `totalTimeoutMs` | `5000`, unset | Per-attempt and overall timeouts |
-| `upstreams.*.tls` | `caFile` | unset | PEM bundle for a privately signed `https://` upstream; replaces the default trust store for that upstream |
+| `upstreams.*.tls` | `caFile`, `certFile`, `keyFile`, `passphrase` | unset | `caFile`: PEM bundle for a privately signed `https://` upstream, replacing the default trust store for that upstream. `certFile` and `keyFile`: a client certificate to present to it (mutual TLS; see "TLS") |
 | `upstreams.*.healthCheck` | `path`, `method`, `intervalMs`, `timeoutMs`, `unhealthyThreshold`, `healthyThreshold`, `expectStatus`, `headers` | off; `GET`, `5000`, `2000`, `2`, `2`, any 2xx, none | Active probing. `timeoutMs` must be below `intervalMs`; probes may not set `Host`, framing or `Upgrade` headers |
 | `upstreams.*.retry` | `maxAttempts`, `baseDelayMs`, `maxDelayMs`, `retryOnStatus`, `retryNonIdempotent` | `3`, `100`, `2000`, `[502,503,504]`, `false` | |
 | `upstreams.*.breaker` | `failureRateThreshold`, `minimumRequests`, `windowMs`, `openDurationMs`, `halfOpenMaxCalls`, `halfOpenSuccesses` | `0.5`, `10`, `10000`, `10000`, `1`, `2` | Applied per target |
 | `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cost`, `cache` | `cost`: `1` | Longest whole-segment prefix wins; `rateLimit: false` disables limiting; `cost` is what a request spends of the budget |
+| `routes[]` | `timeoutMs`, `totalTimeoutMs`, `retry`, `maxBodyBytes` | the upstream's, or the global `maxBodyBytes` | Per-route policy (see "Retries, balancing and the circuit breaker"). `retry` takes any of the upstream's retry settings; each one given replaces the upstream's |
 | `routes[].websocket` | `allowedOrigins`, `allowAnyOrigin`, `idleTimeoutMs`, `maxDurationMs`, `maxConnections` | `[]`, `false`, `60000`, unset, `1000` | Proxy WebSocket upgrades on this route (see "WebSockets"). Off unless present; cannot be combined with `cache` |
-| `routes[].cache` | `ttlMs`, `varyHeaders`, `forwardHeaders` | `-`, `[authorization, x-api-key]`, `[accept, accept-language]` | See "Cache poisoning" |
+| `routes[].cache` | `ttlMs`, `varyHeaders`, `forwardHeaders`, `staleWhileRevalidateMs`, `staleIfErrorMs` | `-`, `[authorization, x-api-key]`, `[accept, accept-language]`, `0`, `0` | See "Serving stale" and "Cache poisoning" |
+
+### Reloading without a restart
+
+Edit the file, then send `SIGHUP` (POSIX), or ask the admin listener, which works everywhere:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" localhost:9090/_gateway/reload
+```
+
+The file is read again exactly as at start-up, environment overrides included, and checked in full, every file it names included (certificates, keys, CA bundles, JWT keys). **All or nothing:** if anything is wrong, nothing changes, the previous configuration stays in force, and the reason is logged and returned (`422 {"ok":false,"error":"..."}`). Otherwise it takes effect at once, and the answer says what changed: `200 {"ok":true,"generation":2,"changed":["rateLimit","routes"],"restartRequired":[]}`.
+
+- **Requests in flight don't notice.** Each one finishes under the configuration it started with; new requests get the new one. Open WebSockets are left alone.
+- **Upstreams** whose settings and certificate files didn't change are kept as they are, with their connections, circuit breakers and health verdicts. One that changed is replaced: its requests in flight finish on the old connections, which close after the last one; its cached responses are dropped; its health checks stop as the new one's start.
+- **Rate limits.** API keys, plans and overrides apply from the next request (a withdrawn key stops working at once). A rule that didn't change keeps its counts. A changed rule starts afresh in memory; in Redis its counts carry over and are read under the new rule (as during a rolling deploy), unless the algorithm itself changed.
+- **The cache** is kept, unless its size limits changed.
+- **Some settings need a restart**, because they belong to something bound once: `port`, `host`, `redis`, `cluster`, the admin listener's address (its `token` does change), turning TLS on or off (the certificate, `minVersion` and HSTS do change) and `limits.maxHeaderBytes`. A reload keeps their running values, applies everything else, and lists them under `restartRequired` and in the log.
+- **In cluster mode** the primary checks the file once, then every worker reloads on its own; the answer has each worker's result, and is `200` only if every one succeeded.
+- **The endpoint takes `POST` only**, needs the admin token when one is set, and refuses any request a browser sent (one carrying `Origin` or `Sec-Fetch-Site`): otherwise any web page could make its visitor's browser post to `127.0.0.1:9090`.
+
+`gateway_config_reloads_total{result}` counts reloads, and `gateway_config_generation` (also `configGeneration` in `/_gateway/health`) says which configuration is running: 1 at start-up, plus one per successful reload. To try a file before reloading it, use `--check`.
 
 ## Observability
 
@@ -405,16 +477,19 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
 
 - `GET /_gateway/live`: always open, says only `{"status":"ok"}`. Liveness: is the process working? Point a container health check or a Kubernetes `livenessProbe` here.
 - `GET /_gateway/ready`: always open. Readiness: should traffic be sent here? `200 {"status":"ready"}` while serving; `503 {"status":"draining"}` from the moment shutdown begins, while the process is still alive and finishing the requests it has. Point a load balancer or `readinessProbe` here and the instance is taken out of rotation before it starts refusing connections, which `live` (rightly) never does. In cluster mode it is also 503 when no worker is ready.
-- `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats (token-gated when one is set)
+- `GET /_gateway/health`: circuit state per upstream and per target, in-flight and connection counts, Redis status, cache stats, the configuration generation in force (token-gated when one is set)
+- `POST /_gateway/reload`: re-read and apply the configuration (see "Reloading without a restart")
 - `GET /_gateway/metrics`: Prometheus text (token-gated when one is set):
   - requests by route/status, latency histogram, rate-limited/degraded/unauthorized/shed counts, authentication outcomes by route and method;
   - TLS handshake failures by cause and certificate expiry;
   - open WebSockets per route, closes by reason, bytes relayed each way;
   - in cluster mode, every series per worker under a `worker` label, plus worker readiness and restarts;
-  - cache outcomes and size; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
+  - cache outcomes and size, stale copies served and background refreshes; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
+  - configuration reloads by result, and the generation in force;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
-- One JSON access-log line per request with `requestId`, route, status, duration, cache result, attempt count and the registered key *name* (never the key). `X-Request-Id` is propagated upstream (client-supplied ids are accepted only if they're safe to log).
+- One JSON access-log line per request with `requestId`, `traceId`, route, status, duration, cache result, attempt count and the registered key *name* (never the key). `X-Request-Id` is propagated upstream (client-supplied ids are accepted only if they're safe to log).
+- **Trace context** ([W3C](https://www.w3.org/TR/trace-context/)). Every forwarded request, WebSocket handshakes and background cache refreshes included, carries a `traceparent` naming the gateway's hop as the parent: the caller's trace continued if it sent a valid one, otherwise a new one. The caller's `tracestate` travels only with its own trace. With the trace id in the access log, a request can be followed from the gateway into the services behind it. The gateway records no spans itself (it has no exporter). At an edge facing clients you don't trust, `tracing.trustIncoming: false` starts a new trace for every request, so a client can't attach its requests to your traces; `tracing.enabled: false` passes the headers through untouched.
 
 ## Performance
 
@@ -487,6 +562,8 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
 - **Security and hardening tests** ([`gateway.security.test.ts`](test/gateway.security.test.ts), [`hardening.test.ts`](test/hardening.test.ts)) attack the gateway: key rotation, cache poisoning, header spoofing, smuggling-shaped framing, slowloris, resource exhaustion.
 - **WebSocket tests** ([`gateway.websocket.test.ts`](test/gateway.websocket.test.ts), [`websocket.test.ts`](test/websocket.test.ts)) speak the protocol to the gateway with a hand-written client and an echo upstream, so no library helps the gateway pass: handshake validation, origin checks, h2c refusal, authentication and limits, the upstream handshake, idle and lifetime limits, half-closed peers, shutdown, `wss://` on both sides.
 - **Edge-case tests** ([`gateway.edge.test.ts`](test/gateway.edge.test.ts)): `HEAD`, chunked uploads, upstreams dying mid-body, HTTPS upstreams, clients leaving during coalesced fetches, graceful shutdown.
+- **Reload tests** ([`gateway.reload.test.ts`](test/gateway.reload.test.ts)) change the configuration under a running gateway: routes, keys and upstreams coming and going, a request in flight finishing on an upstream that was replaced under it, unchanged upstreams keeping their connections and circuit state, limits keeping or restarting their counts, a broken file changing nothing, settings that need a restart, TLS, the cache, health checks, open WebSockets, and the endpoint's guards.
+- **Feature tests** for per-route policies ([`gateway.routePolicy.test.ts`](test/gateway.routePolicy.test.ts)), serving stale ([`gateway.stale.test.ts`](test/gateway.stale.test.ts)), trace context ([`trace.test.ts`](test/trace.test.ts), [`gateway.trace.test.ts`](test/gateway.trace.test.ts)) and client certificates towards upstreams ([`gateway.upstreamMtls.test.ts`](test/gateway.upstreamMtls.test.ts)).
 - **Redis integration tests** run the Lua scripts against a real Redis. They check exact parity with the in-memory implementation over randomized sequences, and exactly-`limit` admission under a concurrent flood from several clients. They are skipped unless `REDIS_URL` is set:
 
   ```bash
@@ -494,11 +571,11 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
   REDIS_URL=redis://127.0.0.1:6379 npm test
   ```
 
-- **End-to-end tests** (`test/e2e/`) run everything as separate processes over real sockets and judge only what a client or operator could see: the shipped config driven exactly as the quick start says (cache, token bucket and refill, deadline, breaker open and recovery, upstream crash), then the whole product together (TLS, API keys and JWTs, a pool of two upstream instances with health checks while one is killed and restarted under load, request coalescing, WebSockets, two gateway processes sharing a budget, a cluster, shutdown) with a real Redis behind a proxy the test can freeze or sever mid-run, and clients that stop reading. `cluster`/`full` need `REDIS_URL`.
+- **End-to-end tests** (`test/e2e/`) run everything as separate processes over real sockets and judge only what a client or operator could see: the shipped config driven exactly as the quick start says (cache, token bucket and refill, deadline, breaker open and recovery, upstream crash), then the whole product together (TLS, API keys and JWTs, a pool of two upstream instances with health checks while one is killed and restarted under load, request coalescing, WebSockets, two gateway processes sharing a budget, a cluster, shutdown) with a real Redis behind a proxy the test can freeze or sever mid-run, and clients that stop reading. Two more files drive the command line (`--check` on good and broken configurations, `--help`) and reloads from outside: an edited file applied through the admin endpoint and on `SIGHUP`, a broken one refused, and a cluster reloading every worker. `cluster`/`full` and the cluster reload need `REDIS_URL`.
 - **Process test** ([`test/process.test.ts`](test/process.test.ts)) starts the real entrypoint and sends it `SIGTERM` mid-request (Linux/macOS).
 - **Cluster tests**: the supervisor (restart and backoff, crash loops, start-up failure, shutdown, the questions it asks workers) runs against fake workers and a fake clock ([`supervisor.test.ts`](test/supervisor.test.ts)), metrics merging and config are unit tests, and [`cluster.integration.test.ts`](test/cluster.integration.test.ts) starts the real entrypoint with several workers against Redis (shared limits, one scrape for all workers, a killed worker replaced, start-up refused when workers cannot start, `SIGTERM` draining on POSIX). Skipped without `REDIS_URL`.
 
-The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones, for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown, and for the cluster the restart backoff, stale-worker handling, reply validation, start-up give-up and the shared limits), a test fails.
+The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones; for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown; for the cluster the restart backoff, stale-worker handling, reply validation, start-up give-up and the shared limits; for reloads the settings held until a restart, replaced upstreams draining before they close, limiter pruning and the endpoint's guards; and the stale-serving windows, trace-context validation, per-route policies and client certificates towards upstreams), a test fails.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint, the suite against a Redis service container on Node 22 and 24, a production-dependency audit, and a Docker image smoke test. Lint and format are [Biome](https://biomejs.dev) (`npm run lint`, `npm run lint:fix`).
 
@@ -506,11 +583,12 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint
 
 ```
 src/
-  gateway.ts              request pipeline: limits, identify, limit, route, cache, balance, breaker, retry, relay; admin listener
+  index.ts                entrypoint: command line, signals, one process or a cluster
+  gateway.ts              request pipeline: limits, identify, limit, route, cache, balance, breaker, retry, relay; live reconfiguration
   config.ts               zod schema, env expansion, cross-field validation
   router.ts               longest-prefix routing on path-segment boundaries
   security.ts             startup notes for risky-but-legal settings
-  admin.ts                the admin listener (token, liveness, health, metrics), fed by whoever hosts it
+  admin.ts                the admin listener (token, liveness, readiness, health, metrics, reload), fed by whoever hosts it
   cluster/                multi-core mode: supervisor (keeps workers alive), primary, worker side, IPC protocol, metrics merge
   net/ip.ts               address normalization (IPv4-mapped, IPv6 /64)
   auth/jwt.ts             JWT verification (HS256/RS256/ES256) and key loading
@@ -525,10 +603,10 @@ src/
     healthChecker.ts      active-probe state machine (thresholds, jittered schedule)
     retry.ts              backoff, jitter, Retry-After
   cache/
-    policy.ts             what may be stored, and for how long
+    policy.ts             what may be stored, for how long, and how long it may be served stale
     responseCache.ts      LRU + byte budget + single-flight
   proxy/                  upstream HTTP client (requests and upgrades), hop-by-hop headers, WebSocket handshake rules and tunnel
-  observability/          logger, Prometheus registry, process metrics
+  observability/          logger, Prometheus registry, process metrics, W3C trace context
 test/                     unit, end-to-end, security, protocol hardening, Redis integration, process signals
 bench/                    load generator, benchmark, soak test, CPU profiler
 demo/                     flaky upstream and load script
@@ -542,6 +620,9 @@ Deliberate scope limits rather than oversights:
 - **One core per worker.** Node runs the request path on a single thread. Cluster mode uses every core of one machine ("Scaling across cores"); beyond a machine, run more instances: the shared limiter state in Redis assumes it. See "Performance" for what one core does.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
-- **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation.
+- **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation, and no client certificates from callers (the gateway presents one to upstreams, but doesn't ask clients for one).
+- **Traces are propagated, not recorded.** Trace context is passed on and trace ids are logged, but the gateway exports no spans of its own (no OpenTelemetry exporter).
+- **Redis is one endpoint.** There is no Sentinel or Redis Cluster support; for failover, use a Redis service that keeps one address.
+- **A reload can't rebind.** The ports, host, Redis connection, number of workers, admin address and TLS on or off need a restart (see "Reloading without a restart").
 - **Sliding window log memory is O(limit) per key.** Use `sliding-window-counter` where the limit is large.
 - Weighted/zone-aware balancing and DNS-based service discovery are natural extensions.

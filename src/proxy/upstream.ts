@@ -61,6 +61,10 @@ export interface UpstreamClientOptions {
    * which burns CPU on handshakes and exhausts ephemeral ports (TIME_WAIT) under sustained load.
    */
   maxConnections?: number;
+  /** Client certificate and key presented to an https upstream that requires mutual TLS. */
+  cert?: Buffer;
+  key?: Buffer;
+  passphrase?: string;
 }
 
 const CONNECT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN']);
@@ -79,7 +83,13 @@ export class UpstreamClient {
     const agentOptions = { keepAlive: true, maxSockets: max, maxFreeSockets: max };
     this.agent =
       this.target.protocol === 'https:'
-        ? new https.Agent({ ...agentOptions, ...(options.ca ? { ca: options.ca } : {}) })
+        ? new https.Agent({
+            ...agentOptions,
+            ...(options.ca ? { ca: options.ca } : {}),
+            ...(options.cert && options.key
+              ? { cert: options.cert, key: options.key, passphrase: options.passphrase }
+              : {}),
+          })
         : new http.Agent(agentOptions);
   }
 

@@ -6,13 +6,12 @@
  * that does not look right is a bug worth ignoring loudly rather than acting on.
  */
 
-export type Collected = 'metrics' | 'health';
+/** What the primary can ask every worker for: its metrics text, its health report, or to reload its configuration. */
+export type Collected = 'metrics' | 'health' | 'reload';
 
 export type ToWorker =
-  /** Report your metrics text or your health report. */
+  /** Report your metrics text or your health report, or reload your configuration and report how it went. */
   | { gw: 'collect'; id: number; what: Collected }
-  /** Re-read the TLS certificate and key. */
-  | { gw: 'reload-tls' }
   /** Stop accepting, finish what is in flight, and exit. */
   | { gw: 'shutdown' };
 
@@ -22,14 +21,14 @@ export type ToPrimary =
   | { gw: 'reply'; id: number; what: Collected; payload: string | Record<string, unknown> };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
-const isCollected = (value: unknown): value is Collected => value === 'metrics' || value === 'health';
+const isCollected = (value: unknown): value is Collected =>
+  value === 'metrics' || value === 'health' || value === 'reload';
 
 export function isToWorker(message: unknown): message is ToWorker {
   if (!isRecord(message)) return false;
   switch (message['gw']) {
     case 'collect':
       return Number.isSafeInteger(message['id']) && isCollected(message['what']);
-    case 'reload-tls':
     case 'shutdown':
       return true;
     default:

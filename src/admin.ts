@@ -28,6 +28,8 @@ export interface AdminSources {
   ready(): AdminAnswer;
   health(): unknown | Promise<unknown>;
   metrics(): string | Promise<string>;
+  /** Re-read and apply the configuration (POST /_gateway/reload). Absent: the endpoint answers 404. */
+  reload?(): AdminAnswer | Promise<AdminAnswer>;
 }
 
 export interface AdminOptions {
@@ -40,16 +42,21 @@ export interface AdminOptions {
 export class AdminListener {
   readonly server: http.Server;
   address?: AddressInfo;
-  private readonly tokenDigest?: Buffer;
+  private tokenDigest?: Buffer;
 
   constructor(
     private readonly options: AdminOptions,
     private readonly sources: AdminSources,
   ) {
-    if (options.token !== undefined) this.tokenDigest = createHash('sha256').update(options.token).digest();
+    this.setToken(options.token);
     this.server = http.createServer({ maxHeaderSize: 8 * 1024 }, (req, res) => void this.handle(req, res));
     this.server.headersTimeout = 5_000;
     this.server.requestTimeout = 10_000;
+  }
+
+  /** Change (or remove) the token, as a configuration reload does. Only its digest is kept. */
+  setToken(token: string | undefined): void {
+    this.tokenDigest = token === undefined ? undefined : createHash('sha256').update(token).digest();
   }
 
   async listen(): Promise<AddressInfo> {
@@ -85,14 +92,15 @@ export class AdminListener {
   }
 
   private async route(req: IncomingMessage): Promise<AdminAnswer> {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      return { status: 405, body: { error: { code: 'method_not_allowed' } }, headers: { allow: 'GET, HEAD' } };
-    }
     let pathname: string;
     try {
       pathname = new URL(req.url ?? '/', 'http://admin.invalid').pathname;
     } catch {
       return { status: 400, body: { error: { code: 'bad_request' } } };
+    }
+    if (pathname === '/_gateway/reload') return this.reload(req);
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return { status: 405, body: { error: { code: 'method_not_allowed' } }, headers: { allow: 'GET, HEAD' } };
     }
 
     if (pathname === '/_gateway/live') return this.sources.live();
@@ -111,6 +119,25 @@ export class AdminListener {
     }
     if (pathname === '/_gateway/health') return { status: 200, body: await this.sources.health() };
     return { status: 404, body: { error: { code: 'route_not_found' } } };
+  }
+
+  /**
+   * The one endpoint that changes something. It takes POST only, and refuses anything a browser sends: a page on any
+   * website can make a browser POST to http://127.0.0.1:9090 without being able to read the answer, and a browser
+   * always says where such a request came from (Origin), where a script or `curl` does not.
+   */
+  private async reload(req: IncomingMessage): Promise<AdminAnswer> {
+    if (req.method !== 'POST') {
+      return { status: 405, body: { error: { code: 'method_not_allowed' } }, headers: { allow: 'POST' } };
+    }
+    if (req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined) {
+      return { status: 403, body: { error: { code: 'forbidden' } } };
+    }
+    if (this.tokenDigest && !this.authorized(req)) {
+      return { status: 401, body: { error: { code: 'unauthorized' } }, headers: { 'www-authenticate': 'Bearer' } };
+    }
+    if (!this.sources.reload) return { status: 404, body: { error: { code: 'route_not_found' } } };
+    return this.sources.reload();
   }
 
   private authorized(req: IncomingMessage): boolean {

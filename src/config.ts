@@ -46,6 +46,15 @@ const retrySchema = z.strictObject({
   retryNonIdempotent: z.boolean().default(false),
 });
 
+/** A route's changes to its upstream's retry settings: each setting given replaces the upstream's, the rest stand. */
+const retryOverrideSchema = z.strictObject({
+  maxAttempts: z.number().int().min(1).max(10).optional(),
+  baseDelayMs: z.number().int().min(0).optional(),
+  maxDelayMs: positiveInt.optional(),
+  retryOnStatus: z.array(z.number().int().min(100).max(599)).optional(),
+  retryNonIdempotent: z.boolean().optional(),
+});
+
 /** Request headers a health probe may not set: they are about framing or routing, not about what to ask. */
 const FORBIDDEN_PROBE_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade']);
 
@@ -115,7 +124,31 @@ const upstreamSchema = z
          * replaces the default trust store for this upstream only. There is deliberately no option to skip
          * verification.
          */
-        caFile: z.string().min(1),
+        caFile: z.string().min(1).optional(),
+        /**
+         * Client certificate and key the gateway presents to this upstream (mutual TLS), for upstreams that only
+         * accept callers they can identify. The pair is checked at start-up and on every reload.
+         */
+        certFile: z.string().min(1).optional(),
+        keyFile: z.string().min(1).optional(),
+        /** For an encrypted `keyFile`. Use ${ENV_VAR}. */
+        passphrase: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).optional()),
+      })
+      .superRefine((tls, ctx) => {
+        if (tls.caFile === undefined && tls.certFile === undefined) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [],
+            message:
+              'set caFile (to trust a private CA), certFile and keyFile (to present a client certificate), or all three',
+          });
+        }
+        if ((tls.certFile === undefined) !== (tls.keyFile === undefined)) {
+          ctx.addIssue({ code: 'custom', path: [], message: 'certFile and keyFile go together' });
+        }
+        if (tls.passphrase !== undefined && tls.keyFile === undefined) {
+          ctx.addIssue({ code: 'custom', path: ['passphrase'], message: 'a passphrase is for keyFile' });
+        }
       })
       .optional(),
   })
@@ -159,6 +192,16 @@ const routeCacheSchema = z.strictObject({
    * (X-Forwarded-Host, X-Original-URL, User-Agent, ...) is withheld from cacheable requests.
    */
   forwardHeaders: z.array(z.string().toLowerCase()).default(['accept', 'accept-language']),
+  /**
+   * How long after an entry goes stale it may still be served at once while a fresh copy is fetched behind the scenes
+   * (stale-while-revalidate, RFC 5861), when the upstream's Cache-Control does not say. 0, the default, means never.
+   */
+  staleWhileRevalidateMs: z.number().int().min(0).default(0),
+  /**
+   * How long after an entry goes stale it may stand in for an upstream that is failing (stale-if-error, RFC 5861):
+   * a 5xx, a timeout, a refused connection, an open circuit. Used when the upstream does not say; 0 means never.
+   */
+  staleIfErrorMs: z.number().int().min(0).default(0),
 });
 
 const jwtIssuerSchema = z
@@ -268,6 +311,20 @@ const routeSchema = z.strictObject({
   websocket: websocketSchema.optional(),
   /** Authenticate callers on this route. Without it the gateway checks no credentials (it only rate limits). */
   auth: routeAuthSchema.optional(),
+  /**
+   * Per-attempt timeout for this route, instead of its upstream's `timeoutMs`. One upstream often serves a lookup
+   * that should take 200 ms and a report that takes 30 s; neither is well served by the same number.
+   */
+  timeoutMs: positiveInt.optional(),
+  /** Overall deadline for this route, across attempts and backoff, instead of its upstream's `totalTimeoutMs`. */
+  totalTimeoutMs: positiveInt.optional(),
+  /**
+   * Retry settings for this route. Each one given replaces its upstream's; the others stand. `{ "maxAttempts": 1 }`
+   * turns retries off for, say, a slow endpoint where a retry would only double the load.
+   */
+  retry: retryOverrideSchema.optional(),
+  /** Largest request body this route accepts, instead of the global `maxBodyBytes` (an upload endpoint, say). */
+  maxBodyBytes: positiveInt.optional(),
 });
 
 const apiKeySchema = z.strictObject({
@@ -391,6 +448,22 @@ export const configSchema = z
          * when the upstream trusts the identity headers and has no use for the secret.
          */
         forwardCredentials: z.boolean().default(true),
+      })
+      .prefault({}),
+
+    /**
+     * W3C Trace Context. Every forwarded request carries a `traceparent` (continuing the caller's trace, or starting
+     * one), with the gateway's hop as the parent, and the access log records the trace id, so one request can be
+     * followed from the gateway into the services behind it. With `enabled: false` the headers pass through as sent.
+     */
+    tracing: z
+      .strictObject({
+        enabled: z.boolean().default(true),
+        /**
+         * Continue a trace the caller started. At an edge facing clients you do not trust, false starts a new trace
+         * for every request, so a client cannot attach its requests to your traces (or flood one of them).
+         */
+        trustIncoming: z.boolean().default(true),
       })
       .prefault({}),
 
@@ -679,6 +752,9 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
   if (raw && typeof raw === 'object') {
     const obj = raw as Record<string, unknown>;
     if (env['PORT']) obj['port'] = Number(env['PORT']);
+    if (env['ADMIN_PORT']) {
+      obj['admin'] = { ...(obj['admin'] as object | undefined), port: Number(env['ADMIN_PORT']) };
+    }
     if (env['WORKERS']) {
       obj['cluster'] = {
         ...(obj['cluster'] as object | undefined),

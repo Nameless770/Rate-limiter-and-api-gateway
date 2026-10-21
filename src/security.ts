@@ -99,3 +99,25 @@ export function securityNotes(config: GatewayConfig): string[] {
 
   return notes;
 }
+
+/**
+ * Settings that are legal but cannot do what they appear to: not a security matter, just a configuration that will
+ * surprise someone. Logged at start-up (and by `--check`) next to the security notes.
+ */
+export function configNotes(config: GatewayConfig): string[] {
+  const notes: string[] = [];
+  // A body is held in memory whole (so a retry can replay it), against one budget shared by every request in flight.
+  const budget = config.limits.maxBufferedBytes;
+  const tooBig = (limit: number, where: string): void => {
+    if (limit <= budget) return;
+    notes.push(
+      `${where} (${limit} bytes) is larger than limits.maxBufferedBytes (${budget}), so a body bigger than ${budget} ` +
+        'bytes is always refused with 503 however idle the gateway is. Raise maxBufferedBytes or lower the limit.',
+    );
+  };
+  tooBig(config.maxBodyBytes, 'maxBodyBytes');
+  for (const route of config.routes) {
+    if (route.maxBodyBytes !== undefined) tooBig(route.maxBodyBytes, `route "${route.id ?? route.path}" maxBodyBytes`);
+  }
+  return notes;
+}

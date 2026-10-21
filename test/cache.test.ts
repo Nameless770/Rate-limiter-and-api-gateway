@@ -18,7 +18,12 @@ describe('parseCacheControl', () => {
 
 describe('storeDecision', () => {
   it('uses the route default when the upstream expresses no opinion', () => {
-    expect(storeDecision(200, {}, 5000)).toEqual({ ttlMs: 5000, vary: [] });
+    expect(storeDecision(200, {}, 5000)).toEqual({
+      ttlMs: 5000,
+      vary: [],
+      staleWhileRevalidateMs: 0,
+      staleIfErrorMs: 0,
+    });
   });
 
   it('prefers s-maxage over max-age over the default', () => {
@@ -193,3 +198,132 @@ describe('ResponseCache byte accounting', () => {
     expect(cache.stats().bytes).toBe(0);
   });
 });
+
+describe('stale windows (RFC 5861)', () => {
+  const route = { whileRevalidateMs: 30_000, ifErrorMs: 60_000 };
+
+  it("takes the upstream's own stale-while-revalidate and stale-if-error", () => {
+    expect(
+      storeDecision(200, { 'cache-control': 'max-age=10, stale-while-revalidate=20, stale-if-error=300' }, 5000),
+    ).toMatchObject({ ttlMs: 10_000, staleWhileRevalidateMs: 20_000, staleIfErrorMs: 300_000 });
+  });
+
+  it("falls back to the route's windows when the upstream gives none", () => {
+    expect(storeDecision(200, { 'cache-control': 'max-age=10' }, 5000, route)).toMatchObject({
+      staleWhileRevalidateMs: 30_000,
+      staleIfErrorMs: 60_000,
+    });
+    // An explicit directive wins over the route default, in either direction.
+    expect(storeDecision(200, { 'cache-control': 'max-age=10, stale-if-error=0' }, 5000, route)).toMatchObject({
+      staleWhileRevalidateMs: 30_000,
+      staleIfErrorMs: 0,
+    });
+  });
+
+  it.each([
+    ['must-revalidate', 'max-age=10, must-revalidate, stale-while-revalidate=20, stale-if-error=20'],
+    ['proxy-revalidate', 'max-age=10, proxy-revalidate, stale-while-revalidate=20, stale-if-error=20'],
+  ])('never allows stale under %s, whatever else is said', (_name, cc) => {
+    expect(storeDecision(200, { 'cache-control': cc }, 5000, route)).toMatchObject({
+      staleWhileRevalidateMs: 0,
+      staleIfErrorMs: 0,
+    });
+  });
+
+  it("does not apply the route's defaults over s-maxage, but honours the upstream's explicit permission", () => {
+    expect(storeDecision(200, { 'cache-control': 's-maxage=10' }, 5000, route)).toMatchObject({
+      staleWhileRevalidateMs: 0,
+      staleIfErrorMs: 0,
+    });
+    expect(storeDecision(200, { 'cache-control': 's-maxage=10, stale-if-error=40' }, 5000, route)).toMatchObject({
+      staleWhileRevalidateMs: 0,
+      staleIfErrorMs: 40_000,
+    });
+  });
+
+  it('keeps a response that is fresh for no time at all if it may be served stale', () => {
+    expect(storeDecision(200, { 'cache-control': 'max-age=0, stale-while-revalidate=30' }, 5000)).toMatchObject({
+      ttlMs: 0,
+      staleWhileRevalidateMs: 30_000,
+    });
+    expect(storeDecision(200, { 'cache-control': 'max-age=0' }, 5000, NO_ROUTE_STALE)).toBeUndefined();
+  });
+
+  it('charges time the response already spent stale elsewhere against its windows', () => {
+    // max-age 10, but it is 25 s old: 15 s into its 20 s stale-while-revalidate window already.
+    expect(
+      storeDecision(200, { 'cache-control': 'max-age=10, stale-while-revalidate=20', age: '25' }, 5000),
+    ).toMatchObject({ ttlMs: 0, staleWhileRevalidateMs: 5_000 });
+    expect(
+      storeDecision(200, { 'cache-control': 'max-age=10, stale-while-revalidate=20', age: '31' }, 5000),
+    ).toBeUndefined();
+  });
+
+  describe('in the store', () => {
+    let now = 0;
+    const cache = () =>
+      new ResponseCache({ maxEntries: 10, maxBytes: 100_000, maxEntryBytes: 10_000, clock: () => now });
+    const stored = (overrides: Partial<CachedResponse>): CachedResponse => ({
+      status: 200,
+      headers: {},
+      body: Buffer.from('v1'),
+      storedAt: 0,
+      expiresAt: 1_000,
+      vary: {},
+      ...overrides,
+    });
+
+    it('returns a stale entry while one of its windows is open, and reports it as stale', () => {
+      now = 0;
+      const c = cache();
+      c.set('k', stored({ staleWhileRevalidateUntil: 2_000, staleIfErrorUntil: 5_000 }));
+      expect(c.lookup('k', {})).toMatchObject({ fresh: true });
+      now = 1_500;
+      expect(c.lookup('k', {})).toMatchObject({ fresh: false });
+      expect(c.get('k', {})).toBeUndefined(); // get() only ever hands out fresh entries
+      now = 4_999;
+      expect(c.lookup('k', {})?.fresh).toBe(false);
+      expect(c.stats()).toMatchObject({ hits: 1, stale: 3 });
+    });
+
+    it('drops it once every window has closed', () => {
+      now = 0;
+      const c = cache();
+      c.set('k', stored({ staleWhileRevalidateUntil: 2_000, staleIfErrorUntil: 3_000 }));
+      now = 3_000;
+      expect(c.lookup('k', {})).toBeUndefined();
+      expect(c.stats().entries).toBe(0);
+    });
+
+    it('keeps an entry with no stale windows no longer than before', () => {
+      now = 0;
+      const c = cache();
+      c.set('k', stored({}));
+      now = 1_000;
+      expect(c.lookup('k', {})).toBeUndefined();
+      expect(c.stats()).toMatchObject({ entries: 0, misses: 1, stale: 0 });
+    });
+
+    it('still applies Vary to a stale entry', () => {
+      now = 0;
+      const c = cache();
+      c.set('k', stored({ staleIfErrorUntil: 5_000, vary: { 'accept-language': 'en' } }));
+      now = 2_000;
+      expect(c.lookup('k', { 'accept-language': 'fr' })).toBeUndefined();
+      expect(c.lookup('k', { 'accept-language': 'en' })?.fresh).toBe(false);
+    });
+
+    it('knows when a fetch is under way for a key', async () => {
+      const c = cache();
+      let release: () => void = () => {};
+      const flight = c.singleFlight('k', () => new Promise<void>((resolve) => (release = resolve)));
+      expect(c.isInFlight('k')).toBe(true);
+      expect(c.isInFlight('other')).toBe(false);
+      release();
+      await flight;
+      expect(c.isInFlight('k')).toBe(false);
+    });
+  });
+});
+
+const NO_ROUTE_STALE = { whileRevalidateMs: 0, ifErrorMs: 0 };

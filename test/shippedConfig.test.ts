@@ -21,10 +21,23 @@ describe('the shipped gateway.config.json', () => {
   });
 
   it('applies the documented environment overrides', () => {
-    const cfg = loadConfig(path, { PORT: '9999', REDIS_URL: 'redis://redis:6379', UPSTREAM_URL: 'http://svc:1' });
+    const cfg = loadConfig(path, {
+      PORT: '9999',
+      ADMIN_PORT: '9191',
+      REDIS_URL: 'redis://redis:6379',
+      UPSTREAM_URL: 'http://svc:1',
+    });
     expect(cfg.port).toBe(9999);
+    expect(cfg.admin.port).toBe(9191);
+    expect(cfg.admin.host).toBe('127.0.0.1'); // only the port moves
     expect(cfg.redis?.url).toBe('redis://redis:6379');
     expect(upstreamTargets(cfg.upstreams['demo'] as never)).toEqual(['http://svc:1']);
+  });
+
+  it('refuses an ADMIN_PORT that is not a port, or that collides with the proxy port', () => {
+    expect(() => loadConfig(path, { ADMIN_PORT: 'nine' })).toThrow(/admin\.port/);
+    expect(() => loadConfig(path, { ADMIN_PORT: '70000' })).toThrow(/admin\.port/);
+    expect(() => loadConfig(path, { PORT: '8181', ADMIN_PORT: '8181' })).toThrow(/admin\.port must differ/);
   });
 
   it('ships with a per-address ceiling, so it does not trip the "header can be dodged" note', () => {

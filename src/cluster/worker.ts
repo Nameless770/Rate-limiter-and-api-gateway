@@ -1,6 +1,6 @@
 /**
  * The worker's side of the conversation with the primary: answer requests for metrics and health, reload the
- * certificate when told, stop when told, and say when it is listening.
+ * configuration when asked (and say how it went), stop when told, and say when it is listening.
  */
 import type { Gateway } from '../gateway.js';
 import { isToWorker, type ToPrimary } from './protocol.js';
@@ -25,11 +25,13 @@ export function serveFromPrimary(
           gw: 'reply',
           id: message.id,
           what: message.what,
-          payload: message.what === 'metrics' ? gateway.renderMetrics() : gateway.healthReport(),
+          payload:
+            message.what === 'metrics'
+              ? gateway.renderMetrics()
+              : message.what === 'health'
+                ? gateway.healthReport()
+                : gateway.reloadFromSource(),
         } as ToPrimary);
-        break;
-      case 'reload-tls':
-        gateway.reloadTls();
         break;
       case 'shutdown':
         void shutdown('primary');

@@ -4,38 +4,92 @@ import { resolveWorkers, runPrimary } from './cluster/primary.js';
 import { serveFromPrimary } from './cluster/worker.js';
 import { ConfigError, type GatewayConfig, loadConfig } from './config.js';
 import { Gateway } from './gateway.js';
-import { createLogger, type Logger, type LogLevel } from './observability/logger.js';
+import { createLogger, type Logger, type LogLevel, silentLogger } from './observability/logger.js';
 import { createRedisClient } from './redisClient.js';
-import { securityNotes } from './security.js';
+import { configNotes, securityNotes } from './security.js';
 
 /** The longest startup waits for Redis to connect (a little over the client's own 2 s connect timeout). */
 const REDIS_STARTUP_WAIT_MS = 2_500;
 
+const USAGE = `Usage: node dist/index.js [config.json] [--check]
+
+  config.json   gateway configuration (default: $GATEWAY_CONFIG, then ./gateway.config.json)
+  --check       validate the configuration and every file it refers to (certificates, keys, CA bundles),
+                print what start-up would warn about, and exit: 0 if the gateway would start, 1 if not.
+                Nothing is bound and nothing is contacted.
+  --help        show this text
+
+Environment: PORT, ADMIN_PORT, REDIS_URL and WORKERS override the file; LOG_LEVEL is debug, info (default),
+warn, error or silent. Values in the file may use \${VAR} and \${VAR:-default}.
+`;
+
 async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    process.stdout.write(USAGE);
+    return;
+  }
+  const unknown = args.filter((a) => a.startsWith('-') && a !== '--check');
+  if (unknown.length > 0) {
+    process.stderr.write(`unknown option ${unknown.join(', ')}\n\n${USAGE}`);
+    process.exit(2);
+  }
+
   const worker = cluster.isWorker ? Number(process.env['GATEWAY_WORKER_INDEX']) : undefined;
   const logger = createLogger(
     (process.env['LOG_LEVEL'] as LogLevel | undefined) ?? 'info',
     undefined,
     worker === undefined ? {} : { worker },
   );
-  const configPath = resolve(process.argv[2] ?? process.env['GATEWAY_CONFIG'] ?? 'gateway.config.json');
+  const configArg = args.find((a) => !a.startsWith('-'));
+  const configPath = resolve(configArg ?? process.env['GATEWAY_CONFIG'] ?? 'gateway.config.json');
 
   const config = loadConfig(configPath);
+  if (args.includes('--check')) {
+    await checkConfig(config, configPath, logger);
+    return;
+  }
   const workers = resolveWorkers(config.cluster.workers);
 
   if (cluster.isPrimary && workers > 1) {
-    for (const note of securityNotes(config)) logger.warn('security', { note });
-    await runPrimary(config, workers, logger);
+    logNotes(config, logger);
+    await runPrimary(config, workers, logger, configPath);
     return;
   }
-  await runGateway(config, logger, cluster.isWorker);
+  await runGateway(config, logger, cluster.isWorker, configPath);
+}
+
+/** What start-up has to say about a configuration that is legal but questionable. */
+function logNotes(config: GatewayConfig, logger: Logger): void {
+  for (const note of securityNotes(config)) logger.warn('security', { note });
+  for (const note of configNotes(config)) logger.warn('config', { note });
+}
+
+/**
+ * `--check`: everything start-up would verify, without starting. Building the gateway reads and checks every file the
+ * configuration names (a certificate that does not match its key, a JWT key that is too weak, an unreadable CA
+ * bundle) and opens nothing: no listener, no connection to Redis or an upstream. A ConfigError from here is reported
+ * like any other start-up failure, with exit status 1.
+ */
+async function checkConfig(config: GatewayConfig, path: string, logger: Logger): Promise<void> {
+  const gateway = new Gateway(config, { logger: silentLogger, manualHealthChecks: true });
+  await gateway.close(0);
+  logNotes(config, logger);
+  logger.info('configuration ok', {
+    path,
+    routes: config.routes.length,
+    upstreams: Object.keys(config.upstreams),
+    workers: resolveWorkers(config.cluster.workers),
+    tls: config.tls !== undefined,
+    redis: config.redis !== undefined,
+  });
 }
 
 /** One gateway in this process: the whole thing when running alone, or one worker of a cluster. */
-async function runGateway(config: GatewayConfig, logger: Logger, isWorker: boolean): Promise<void> {
+async function runGateway(config: GatewayConfig, logger: Logger, isWorker: boolean, configPath: string): Promise<void> {
   if (!isWorker) {
     // A cluster's primary has already said these once for all its workers.
-    for (const note of securityNotes(config)) logger.warn('security', { note });
+    logNotes(config, logger);
   }
 
   const redis = config.redis ? createRedisClient(config.redis, logger) : undefined;
@@ -59,8 +113,14 @@ async function runGateway(config: GatewayConfig, logger: Logger, isWorker: boole
   }
 
   // The primary hosts the admin listener for its workers, with everyone's metrics in one place.
-  const gatewayConfig = isWorker ? { ...config, admin: { ...config.admin, enabled: false } } : config;
-  const gateway = new Gateway(gatewayConfig, { logger, redis });
+  const forThisProcess = (c: GatewayConfig): GatewayConfig =>
+    isWorker ? { ...c, admin: { ...c.admin, enabled: false } } : c;
+  const gateway = new Gateway(forThisProcess(config), {
+    logger,
+    redis,
+    // A reload reads the file again, environment overrides and all, exactly as start-up did.
+    loadConfig: () => forThisProcess(loadConfig(configPath)),
+  });
   const address = await gateway.listen();
 
   let shuttingDown = false;
@@ -88,10 +148,11 @@ async function runGateway(config: GatewayConfig, logger: Logger, isWorker: boole
       redis: redis ? 'enabled' : 'disabled',
       failureMode: config.rateLimit.failureMode,
     });
-    // Certificate renewal: SIGHUP re-reads the files. (Windows has no such signal.)
-    if (config.tls && process.platform !== 'win32') {
+    // SIGHUP re-reads the configuration and applies it, certificate files included (which is how renewals are picked
+    // up). Windows has no such signal: POST /_gateway/reload on the admin listener does the same everywhere.
+    if (process.platform !== 'win32') {
       process.on('SIGHUP', () => {
-        gateway.reloadTls();
+        gateway.reloadFromSource();
       });
     }
   }
