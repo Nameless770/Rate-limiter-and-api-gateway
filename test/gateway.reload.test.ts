@@ -231,7 +231,7 @@ describe('reloading the configuration', () => {
     expect(now.admin.host).toBe('127.0.0.1');
     expect(now.admin.token).toBe('a-sufficiently-long-token'); // the token is not fixed...
     expect(now.limits.headersTimeoutMs).toBe(4_000); // ...nor are the other limits
-    expect(g.gateway.server.headersTimeout).toBe(4_000);
+    expect((g.gateway.server as http.Server).headersTimeout).toBe(4_000);
     expect((await from(g, '/two')).status).toBe(200);
   });
 

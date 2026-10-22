@@ -13,7 +13,11 @@ const HOP_BY_HOP = new Set([
   'upgrade',
 ]);
 
-/** Copy headers minus hop-by-hop ones, including any named in the `Connection` header itself. */
+/**
+ * Copy headers minus hop-by-hop ones, including any named in the `Connection` header itself, and minus HTTP/2's
+ * pseudo-headers (`:method`, `:path`, `:authority`, `:scheme`): they describe this hop's request, and are not header
+ * names an HTTP/1.1 upstream could even receive.
+ */
 export function stripHopByHop(headers: IncomingHttpHeaders): Record<string, string | string[]> {
   const named = new Set(
     String(headers['connection'] ?? '')
@@ -25,7 +29,7 @@ export function stripHopByHop(headers: IncomingHttpHeaders): Record<string, stri
   for (const [name, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || named.has(lower)) continue;
+    if (HOP_BY_HOP.has(lower) || named.has(lower) || lower.startsWith(':')) continue;
     out[lower] = value;
   }
   return out;

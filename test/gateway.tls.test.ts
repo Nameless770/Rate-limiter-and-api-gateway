@@ -299,6 +299,7 @@ describe('tls configuration', () => {
       certFile: 'c',
       keyFile: 'k',
       minVersion: 'TLSv1.2',
+      http2: false,
     });
     expect(() => withTls({ certFile: 'c' })).toThrow();
     expect(() => withTls({ certFile: 'c', keyFile: 'k', minVersion: 'TLSv1.1' })).toThrow();

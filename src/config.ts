@@ -406,6 +406,11 @@ export const configSchema = z
         /** Send `Strict-Transport-Security: max-age=N` on every response. Leave unset until you are sure. */
         hstsMaxAgeSeconds: z.number().int().min(1).max(63_072_000).optional(),
         /**
+         * Speak HTTP/2 to clients that offer it during the TLS handshake (ALPN), and HTTP/1.1 on the same port to the
+         * rest, WebSocket upgrades included. Upstreams are still called over HTTP/1.1.
+         */
+        http2: z.boolean().default(false),
+        /**
          * Ask clients for a certificate (mutual TLS), so routes can authenticate callers with `client-cert`. Only a
          * certificate issued by `caFile`, unexpired and not on `crlFile`, counts.
          */
@@ -644,6 +649,11 @@ export const configSchema = z
         /** Total request-body bytes held in memory across all in-flight requests. */
         maxBufferedBytes: positiveInt.default(64 * 1024 * 1024),
         maxHeaderBytes: positiveInt.default(16 * 1024),
+        /**
+         * HTTP/2 (tls.http2) only: requests one connection may have in progress at once. Each still counts toward
+         * maxInFlight; this stops one connection from taking all of it.
+         */
+        maxConcurrentStreams: positiveInt.max(10_000).default(100),
         /** Time a client gets to finish sending request headers (slowloris defence). */
         headersTimeoutMs: positiveInt.default(15_000),
         /** Time a client gets to finish sending a whole request. */

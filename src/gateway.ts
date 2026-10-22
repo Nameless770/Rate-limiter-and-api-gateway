@@ -1,10 +1,16 @@
 import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http, { type IncomingHttpHeaders, type IncomingMessage, ServerResponse } from 'node:http';
+import http2, {
+  type Http2SecureServer,
+  Http2ServerRequest,
+  Http2ServerResponse,
+  type ServerHttp2Session,
+} from 'node:http2';
 import https from 'node:https';
 import type { AddressInfo, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
-import { createSecureContext, type TLSSocket } from 'node:tls';
+import { createSecureContext, type TLSSocket, Server as TlsServer } from 'node:tls';
 import { AdminListener } from './admin.js';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
 import {
@@ -68,6 +74,47 @@ import { CircuitBreaker, CircuitOpenError, type CircuitState, type Permit } from
 import { HealthChecker, type ProbeResult } from './resilience/healthChecker.js';
 import { retry } from './resilience/retry.js';
 import { Router } from './router.js';
+
+/**
+ * A client's request and response, over HTTP/1.1 or HTTP/2. Node's HTTP/2 compatibility API makes the two alike;
+ * where they differ (connection headers, tearing down a response) the helpers below say how.
+ */
+type ClientRequest = IncomingMessage | Http2ServerRequest;
+type ClientResponse = ServerResponse | Http2ServerResponse;
+
+/** The response has been torn down: its connection, or (HTTP/2) its stream. */
+function isDestroyed(res: ClientResponse): boolean {
+  return res instanceof Http2ServerResponse ? res.stream.destroyed : res.destroyed;
+}
+
+/** What the gateway writes a response with: the same on both protocols, though TypeScript cannot call a union of the
+ * two classes' overloads. */
+interface ResponseWriter {
+  writeHead(status: number, headers: Record<string, string | string[] | number>): unknown;
+  write(chunk: Uint8Array): boolean;
+}
+const writer = (res: ClientResponse): ResponseWriter => res as unknown as ResponseWriter;
+
+/**
+ * Abandon a response part-way, so the client knows it is incomplete. On HTTP/1.1 that means cutting the connection;
+ * on HTTP/2 it means resetting the stream with an error code: a plain destroy would reset it with NO_ERROR, which a
+ * client reads as a normal end, and a truncated body would pass for a whole one.
+ */
+function abandon(res: ClientResponse, why: 'cancelled' | 'failed'): void {
+  if (res instanceof Http2ServerResponse) {
+    res.stream.close(why === 'cancelled' ? http2.constants.NGHTTP2_CANCEL : http2.constants.NGHTTP2_INTERNAL_ERROR);
+  } else {
+    res.destroy();
+  }
+}
+
+/**
+ * Ask for the client's connection to close once this response is done (HTTP/1.1's `Connection: close`). An HTTP/2
+ * connection carries other requests and has no such header; shutdown closes it with GOAWAY instead.
+ */
+function closeConnectionAfter(res: ClientResponse): void {
+  if (!(res instanceof Http2ServerResponse) && !res.headersSent) res.setHeader('connection', 'close');
+}
 
 export interface GatewayDeps {
   logger?: Logger;
@@ -216,6 +263,8 @@ interface RequestContext {
   trace?: TraceContext;
   /** The path prefix of the route it matched, for span names (low-cardinality, unlike the request path). */
   routePath?: string;
+  /** Which HTTP the client spoke: "1.1" or "2.0" (`httpVersion`). */
+  httpVersion: string;
 }
 
 /** What a WebSocket handshake attempt came to: a connection to join, or the upstream's own refusal to relay. */
@@ -332,7 +381,7 @@ const PROXY_HEADERS = [
 ];
 
 export class Gateway {
-  readonly server: http.Server | https.Server;
+  readonly server: http.Server | https.Server | Http2SecureServer;
   readonly metrics = new Registry();
   /** Where the admin listener is bound, once listen() has run (and the admin listener is enabled). */
   adminAddress?: AddressInfo;
@@ -360,7 +409,11 @@ export class Gateway {
   /** Expiry of the certificate currently being served (TLS only). */
   private certNotAfter?: Date;
   /** Responses still in progress, so shutdown can ask them not to keep their connection alive. */
-  private readonly active = new Set<ServerResponse>();
+  private readonly active = new Set<ClientResponse>();
+  /** Open HTTP/2 connections, so shutdown can send each a GOAWAY and, after the grace period, cut it. */
+  private readonly sessions = new Set<ServerHttp2Session>();
+  /** Every client connection (TCP), so shutdown can cut what is left of any kind once the grace period is over. */
+  private readonly sockets = new Set<Socket>();
   /** Joined WebSocket connections, so shutdown can end them (they would otherwise keep the server open forever). */
   private readonly tunnels = new Set<Tunnel>();
   /** Client sockets that have asked to upgrade, from the request until they close. */
@@ -467,35 +520,45 @@ export class Gateway {
       // a slow client is cut off close to the configured time rather than up to 30s later.
       connectionsCheckingInterval: Math.min(1_000, limits.headersTimeoutMs),
     };
-    const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
+    const onRequest = (req: ClientRequest, res: ClientResponse): void => {
       void this.handle(req, res);
     };
     const material = this.rt.tls;
     if (config.tls && material) {
       this.certNotAfter = material.notAfter;
       this.warnIfExpiring(material.notAfter);
-      this.server = https.createServer(
-        {
-          ...serverOptions,
-          cert: material.cert,
-          key: material.key,
-          passphrase: material.passphrase,
-          minVersion: config.tls.minVersion,
-          // A client that connects and never completes the handshake would otherwise hold a socket for two minutes.
-          handshakeTimeout: limits.headersTimeoutMs,
-          // Callers' certificates: asked for when client-certificate auth is on. Unless every route needs one, a
-          // connection without a (valid) certificate still gets through the handshake, and each route decides.
-          ...(config.tls.clientAuth
-            ? {
-                requestCert: true,
-                rejectUnauthorized: config.tls.clientAuth.required,
-                ca: material.clientCa,
-                crl: material.crl,
-              }
-            : {}),
-        },
-        onRequest,
-      );
+      const tlsOptions = {
+        cert: material.cert,
+        key: material.key,
+        passphrase: material.passphrase,
+        minVersion: config.tls.minVersion,
+        // A client that connects and never completes the handshake would otherwise hold a socket for two minutes.
+        handshakeTimeout: limits.headersTimeoutMs,
+        // Callers' certificates: asked for when client-certificate auth is on. Unless every route needs one, a
+        // connection without a (valid) certificate still gets through the handshake, and each route decides.
+        ...(config.tls.clientAuth
+          ? {
+              requestCert: true,
+              rejectUnauthorized: config.tls.clientAuth.required,
+              ca: material.clientCa,
+              crl: material.crl,
+            }
+          : {}),
+      };
+      if (config.tls.http2) {
+        // HTTP/2 for clients that offer it in the TLS handshake (ALPN), HTTP/1.1 on the same port for the rest. The
+        // same handler serves both: Node's compatibility API hands it request and response objects of either kind.
+        const server = http2.createSecureServer(
+          { ...tlsOptions, allowHTTP1: true, settings: this.http2Settings(limits) },
+          onRequest as (req: Http2ServerRequest, res: Http2ServerResponse) => void,
+        );
+        // The HTTP/1.1 side of the server reads these as an http.Server would.
+        Object.assign(server, serverOptions);
+        server.on('session', (session) => this.trackSession(session));
+        this.server = server;
+      } else {
+        this.server = https.createServer({ ...serverOptions, ...tlsOptions }, onRequest);
+      }
       this.server.on('tlsClientError', (error) => {
         const code = (error as NodeJS.ErrnoException).code ?? '';
         this.mTlsFailures.inc({ reason: /^ERR_(SSL|TLS)_/.test(code) ? code : 'other' });
@@ -531,7 +594,7 @@ export class Gateway {
    */
   reloadTls(): { ok: true; notAfter: Date } | { ok: false; reason: string } {
     const tlsConfig = this.rt.config.tls;
-    if (!tlsConfig || !(this.server instanceof https.Server)) return { ok: false, reason: 'TLS is not enabled' };
+    if (!tlsConfig || !(this.server instanceof TlsServer)) return { ok: false, reason: 'TLS is not enabled' };
     try {
       const material = readTlsMaterial(tlsConfig); // validates the pair before anything is swapped
       this.applyTls(tlsConfig, material);
@@ -545,7 +608,7 @@ export class Gateway {
 
   /** Serve new connections with this certificate, key and minimum version. Open connections keep what they had. */
   private applyTls(tls: NonNullable<GatewayConfig['tls']>, material: TlsMaterial): void {
-    if (!(this.server instanceof https.Server)) return;
+    if (!(this.server instanceof TlsServer)) return;
     this.server.setSecureContext({
       cert: material.cert,
       key: material.key,
@@ -613,12 +676,15 @@ export class Gateway {
     for (const socket of this.upgradeSockets) socket.destroy();
     const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
     // Idle keep-alive connections go now. Busy ones are told not to be reused and are closed as soon as their
-    // response completes (see finish()), so clients don't send new requests into a process that is exiting.
-    this.server.closeIdleConnections();
-    for (const res of this.active) {
-      if (!res.headersSent) res.setHeader('connection', 'close');
-    }
-    const force = setTimeout(() => this.server.closeAllConnections(), graceMs);
+    // response completes (see finish()), so clients don't send new requests into a process that is exiting. An
+    // HTTP/2 connection is sent GOAWAY: no new requests on it, and it closes once the ones it carries are done.
+    (this.server as http.Server).closeIdleConnections();
+    for (const res of this.active) closeConnectionAfter(res);
+    for (const session of this.sessions) session.close();
+    const force = setTimeout(() => {
+      for (const session of this.sessions) session.destroy();
+      for (const socket of this.sockets) socket.destroy();
+    }, graceMs);
     force.unref();
     await closed;
     clearTimeout(force);
@@ -966,10 +1032,35 @@ export class Gateway {
   }
 
   private applyServerLimits(limits: GatewayConfig['limits']): void {
-    this.server.maxConnections = limits.maxConnections;
-    this.server.headersTimeout = limits.headersTimeoutMs;
-    this.server.requestTimeout = limits.requestTimeoutMs;
-    this.server.keepAliveTimeout = limits.keepAliveTimeoutMs;
+    // An HTTP/2 server has these too, for the HTTP/1.1 connections it serves; its typings just do not say so.
+    const server = this.server as http.Server;
+    server.maxConnections = limits.maxConnections;
+    server.headersTimeout = limits.headersTimeoutMs;
+    server.requestTimeout = limits.requestTimeoutMs;
+    server.keepAliveTimeout = limits.keepAliveTimeoutMs;
+    // New HTTP/2 connections get the new settings; open ones keep what they agreed.
+    if (this.isHttp2Server(this.server)) this.server.updateSettings(this.http2Settings(limits));
+  }
+
+  private isHttp2Server(server: this['server']): server is Http2SecureServer {
+    return 'updateSettings' in server;
+  }
+
+  /** What the gateway announces to each HTTP/2 client: how many requests at once, how big a header block. */
+  private http2Settings(limits: GatewayConfig['limits']): http2.Settings {
+    return { maxConcurrentStreams: limits.maxConcurrentStreams, maxHeaderListSize: limits.maxHeaderBytes };
+  }
+
+  /**
+   * An HTTP/2 connection. It is tracked for shutdown, and closed politely (GOAWAY) once it has been idle for the
+   * keep-alive timeout, as an idle HTTP/1.1 connection would be.
+   */
+  private trackSession(session: ServerHttp2Session): void {
+    this.sessions.add(session);
+    session.once('close', () => this.sessions.delete(session));
+    session.on('error', () => {}); // a broken connection is the client's problem; its streams see it themselves
+    session.setTimeout(this.rt.config.limits.keepAliveTimeoutMs, () => session.close());
+    if (this.closing) session.close();
   }
 
   private makeLimiter(label: string, rule: RateLimitRuleConfig, config: GatewayConfig): RouteLimiter {
@@ -1171,6 +1262,9 @@ export class Gateway {
     this.metrics.gauge('gateway_connections', 'Open client connections.', () => [
       { labels: {}, value: this.connections },
     ]);
+    this.metrics.gauge('gateway_http2_connections', 'Open client connections speaking HTTP/2 (tls.http2 only).', () => [
+      { labels: {}, value: this.sessions.size },
+    ]);
     this.metrics.gauge('gateway_inflight_requests', 'Requests currently being handled.', () => [
       { labels: {}, value: this.active.size },
     ]);
@@ -1181,8 +1275,10 @@ export class Gateway {
 
   private trackConnection(socket: Socket): void {
     this.connections++;
+    this.sockets.add(socket);
     socket.once('close', () => {
       this.connections--;
+      this.sockets.delete(socket);
     });
 
     const { limits, rateLimit } = this.rt.config;
@@ -1207,13 +1303,14 @@ export class Gateway {
   // Request pipeline
   // ------------------------------------------------------------------------------------------------------------------
 
-  private newContext(req: IncomingMessage): RequestContext {
+  private newContext(req: ClientRequest): RequestContext {
     const { tracing } = this.rt.config;
     return {
       rt: this.rt,
       trace: tracing.enabled ? startOrContinue(req.headers, tracing) : undefined,
       requestId: sanitizeRequestId(req.headers['x-request-id']) ?? randomUUID(),
       method: req.method ?? 'GET',
+      httpVersion: req.httpVersion,
       path: '',
       route: '-',
       attempts: 0,
@@ -1227,11 +1324,11 @@ export class Gateway {
   }
 
   /** The headers every response carries, and the bookkeeping that runs when the response (or its connection) ends. */
-  private trackResponse(res: ServerResponse, ctx: RequestContext): void {
+  private trackResponse(res: ClientResponse, ctx: RequestContext): void {
     res.setHeader('x-request-id', ctx.requestId);
     const hsts = ctx.rt.config.tls?.hstsMaxAgeSeconds;
     if (hsts) res.setHeader('strict-transport-security', `max-age=${hsts}`);
-    if (this.closing) res.setHeader('connection', 'close');
+    if (this.closing) closeConnectionAfter(res);
 
     this.active.add(res);
     res.once('close', () => {
@@ -1242,10 +1339,11 @@ export class Gateway {
     });
   }
 
-  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async handle(req: ClientRequest, res: ClientResponse): Promise<void> {
     const ctx = this.newContext(req);
     const shed = this.active.size >= ctx.rt.config.limits.maxInFlight;
     this.trackResponse(res, ctx);
+    if (req instanceof Http2ServerRequest) this.boundRequestTime(req, res, ctx.rt.config.limits.requestTimeoutMs);
 
     try {
       if (shed) throw new OverloadedError('too many requests in flight');
@@ -1255,7 +1353,25 @@ export class Gateway {
     }
   }
 
-  private async dispatch(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): Promise<void> {
+  /**
+   * `limits.requestTimeoutMs` for an HTTP/2 request, which Node's HTTP/1.1 request timeout does not cover: a client
+   * that has not finished sending its request in time has the stream cancelled (its connection, and the other
+   * requests on it, carry on). Waiting for the response is not counted.
+   */
+  private boundRequestTime(req: Http2ServerRequest, res: ClientResponse, ms: number): void {
+    if (req.complete) return;
+    const timer = setTimeout(() => {
+      if (req.complete) return;
+      this.mShed.inc({ reason: 'request_timeout' });
+      req.stream.close(http2.constants.NGHTTP2_CANCEL);
+    }, ms);
+    timer.unref();
+    const done = (): void => clearTimeout(timer);
+    req.once('end', done);
+    res.once('close', done);
+  }
+
+  private async dispatch(req: ClientRequest, res: ClientResponse, ctx: RequestContext): Promise<void> {
     if (!ctx.rt.allowedMethods.has(ctx.method)) {
       return this.sendError(res, ctx, 405, 'method_not_allowed', 'method not allowed', {
         allow: [...ctx.rt.allowedMethods].join(', '),
@@ -1308,8 +1424,8 @@ export class Gateway {
 
   /** Authentication and rate limiting. Returns false if the request was rejected (response already sent). */
   private async admitted(
-    req: IncomingMessage,
-    res: ServerResponse,
+    req: ClientRequest,
+    res: ClientResponse,
     ctx: RequestContext,
     route: RouteConfig,
     routeId: string,
@@ -1399,7 +1515,7 @@ export class Gateway {
    * to mean anonymous, and only where `required` is false.
    */
   private authenticate(
-    req: IncomingMessage,
+    req: ClientRequest,
     rt: Runtime,
     auth: NonNullable<RouteConfig['auth']>,
     presentedKey: string | undefined,
@@ -1490,7 +1606,7 @@ export class Gateway {
    * the certificate's subject common name, and identified (for rate limits) by its issuer and subject together, so a
    * renewed certificate keeps its budget while another CA cannot mint a lookalike.
    */
-  private peerCertificate(req: IncomingMessage, rt: Runtime): PeerCertificate {
+  private peerCertificate(req: ClientRequest, rt: Runtime): PeerCertificate {
     const socket = req.socket as TLSSocket;
     if (!socket.encrypted || typeof socket.getPeerCertificate !== 'function') return { kind: 'none' };
     const peer = socket.getPeerCertificate();
@@ -1530,7 +1646,7 @@ export class Gateway {
     };
   }
 
-  private reject(res: ServerResponse, ctx: RequestContext, routeId: string, decision: RateLimitDecision): false {
+  private reject(res: ClientResponse, ctx: RequestContext, routeId: string, decision: RateLimitDecision): false {
     ctx.rateLimited = true;
     this.mRateLimited.inc({ route: routeId });
     const retryAfter = Math.max(1, Math.ceil(decision.retryAfterMs / 1000));
@@ -1543,7 +1659,7 @@ export class Gateway {
    * outermost trusted proxy appended to X-Forwarded-For; anything that doesn't parse as an address falls back
    * to the socket, so attacker-chosen text is never used as a key.
    */
-  private clientIp(req: IncomingMessage, rt: Runtime): string {
+  private clientIp(req: ClientRequest, rt: Runtime): string {
     const { trustedProxyHops: hops, ipv6Prefix } = rt.config.rateLimit;
     if (hops > 0) {
       const raw = req.headers['x-forwarded-for'];
@@ -1562,8 +1678,8 @@ export class Gateway {
   // ------------------------------------------------------------------------------------------------------------------
 
   private async cachedGet(
-    req: IncomingMessage,
-    res: ServerResponse,
+    req: ClientRequest,
+    res: ClientResponse,
     ctx: RequestContext,
     route: RouteConfig,
     upstream: UpstreamRuntime,
@@ -1691,7 +1807,7 @@ export class Gateway {
    * fails, the stale copy stays in service until its windows close.
    */
   private refreshInBackground(
-    req: IncomingMessage,
+    req: ClientRequest,
     ctx: RequestContext,
     upstream: UpstreamRuntime,
     policy: RoutePolicy,
@@ -1718,6 +1834,7 @@ export class Gateway {
       trace: ctx.trace ? childOf(ctx.trace) : undefined,
       requestId: randomUUID(),
       method: 'GET',
+      httpVersion: '1.1', // the gateway's own request
       path: ctx.path,
       route: ctx.route,
       upstream: ctx.upstream,
@@ -1836,14 +1953,14 @@ export class Gateway {
   }
 
   private async serveEntry(
-    res: ServerResponse,
+    res: ClientResponse,
     ctx: RequestContext,
     entry: CachedResponse,
     as: 'HIT' | 'STALE',
   ): Promise<void> {
     ctx.cache = as;
     const age = Math.max(0, Math.floor((this.clock() - entry.storedAt) / 1000));
-    res.writeHead(entry.status, { ...entry.headers, age: String(age), 'x-cache': as });
+    writer(res).writeHead(entry.status, { ...entry.headers, age: String(age), 'x-cache': as });
     const body = entry.body;
     if (body.length <= WRITE_SLICE_BYTES) {
       res.end(body); // fits in the socket's buffers whatever the client does, so there is nothing to wait for
@@ -1851,9 +1968,9 @@ export class Gateway {
     }
     // A big entry goes out in slices so that a client which stops reading is noticed and dropped, not waited on.
     for (let offset = 0; offset < body.length; offset += WRITE_SLICE_BYTES) {
-      if (res.destroyed) return;
+      if (isDestroyed(res)) return;
       const slice = body.subarray(offset, offset + WRITE_SLICE_BYTES);
-      if (!res.write(slice) && !(await this.drained(res, ctx))) return;
+      if (!writer(res).write(slice) && !(await this.drained(res, ctx))) return;
     }
     res.end();
   }
@@ -1862,7 +1979,7 @@ export class Gateway {
    * Wait for a client to take the data it has been sent. False if it has gone, or has stopped reading for longer
    * than `limits.responseStallTimeoutMs` (in which case it is dropped here).
    */
-  private async drained(res: ServerResponse, ctx: RequestContext): Promise<boolean> {
+  private async drained(res: ClientResponse, ctx: RequestContext): Promise<boolean> {
     const stallMs = ctx.rt.config.limits.responseStallTimeoutMs;
     const outcome = await waitForDrain(res, stallMs);
     if (outcome === 'stalled') {
@@ -1872,7 +1989,7 @@ export class Gateway {
         route: ctx.route,
         stalledMs: stallMs,
       });
-      res.destroy();
+      abandon(res, 'cancelled');
     }
     return outcome === 'drained';
   }
@@ -1908,8 +2025,8 @@ export class Gateway {
   }
 
   private async forward(
-    req: IncomingMessage,
-    res: ServerResponse,
+    req: ClientRequest,
+    res: ClientResponse,
     ctx: RequestContext,
     upstream: UpstreamRuntime,
     policy: RoutePolicy,
@@ -2314,7 +2431,7 @@ export class Gateway {
    * header an upstream might reflect into a response can't be used to poison an entry other clients receive.
    */
   private upstreamHeaders(
-    req: IncomingMessage,
+    req: ClientRequest,
     ctx: RequestContext,
     body: Buffer | undefined,
     cacheable: boolean,
@@ -2386,7 +2503,7 @@ export class Gateway {
 
   /** Stream the upstream response to the client, optionally keeping a copy for the cache. */
   private async relay(
-    res: ServerResponse,
+    res: ClientResponse,
     ctx: RequestContext,
     up: UpstreamResponse,
     store?: StoreOptions,
@@ -2399,7 +2516,7 @@ export class Gateway {
     let size = 0;
 
     const headers = stripHopByHop(up.headers);
-    res.writeHead(up.status, headers);
+    writer(res).writeHead(up.status, headers);
 
     let clientGone = false;
     const onClose = (): void => {
@@ -2420,8 +2537,8 @@ export class Gateway {
             chunks.push(chunk);
           }
         }
-        if (clientGone || res.destroyed) return { clientGone: true };
-        if (!res.write(chunk) && !(await this.drained(res, ctx))) {
+        if (clientGone || isDestroyed(res)) return { clientGone: true };
+        if (!writer(res).write(chunk) && !(await this.drained(res, ctx))) {
           clientGone = true;
           up.stream.destroy(); // this listener is gone before 'close' fires, so release the upstream here
           return { clientGone: true };
@@ -2432,13 +2549,13 @@ export class Gateway {
       // The upstream died mid-body. Destroying the connection is the only honest signal left: the status
       // line already went out, and ending normally would hand the client a truncated body as if complete.
       ctx.upstreamTruncated = true;
-      res.destroy();
+      abandon(res, 'failed');
       return { clientGone: false };
     } finally {
       res.off('close', onClose);
     }
 
-    if (clientGone || res.destroyed) return { clientGone: true };
+    if (clientGone || isDestroyed(res)) return { clientGone: true };
     res.end();
 
     if (!collecting || !decision || !store) return { clientGone: false };
@@ -2486,7 +2603,7 @@ export class Gateway {
    * Content-Length. Uses events rather than `for await`: breaking out of an async iterator destroys the
    * request, and with it the socket, before the 413 could be written.
    */
-  private readBody(req: IncomingMessage, ctx: RequestContext, limit: number): Promise<Buffer | undefined> {
+  private readBody(req: ClientRequest, ctx: RequestContext, limit: number): Promise<Buffer | undefined> {
     const budget = ctx.rt.config.limits.maxBufferedBytes;
     const declared = Number(req.headers['content-length']);
     if (Number.isFinite(declared) && declared > limit) return Promise.reject(new PayloadTooLargeError(limit));
@@ -2552,7 +2669,7 @@ export class Gateway {
    * upstream addresses, error codes or timings. The detail is logged against the same request id.
    */
   private sendError(
-    res: ServerResponse,
+    res: ClientResponse,
     ctx: RequestContext,
     status: number,
     code: string,
@@ -2560,21 +2677,30 @@ export class Gateway {
     headers: Record<string, string | number> = {},
   ): void {
     if (res.headersSent) {
-      res.destroy();
+      abandon(res, 'failed');
       return;
     }
     const payload = JSON.stringify({ error: { code, message, requestId: ctx.requestId } });
-    res.writeHead(status, {
+    const { connection, ...rest } = headers;
+    const h2 = res instanceof Http2ServerResponse;
+    writer(res).writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'content-length': Buffer.byteLength(payload),
       'x-content-type-options': 'nosniff',
       'cache-control': 'no-store',
-      ...headers,
+      ...(h2 ? rest : headers),
     });
     res.end(payload);
+    if (h2 && connection === 'close') {
+      // HTTP/2's way of saying "stop sending me this request" (RFC 9113 §8.1): once the response is complete, reset
+      // the stream with NO_ERROR, so a refused upload is not received only to be thrown away.
+      res.once('finish', () => {
+        if (!res.req.complete) res.stream.close(http2.constants.NGHTTP2_NO_ERROR);
+      });
+    }
   }
 
-  private fail(res: ServerResponse, ctx: RequestContext, error: unknown): void {
+  private fail(res: ClientResponse, ctx: RequestContext, error: unknown): void {
     if (error instanceof ClientAbortedError) return; // nobody left to answer
     if (error instanceof PayloadTooLargeError) {
       this.sendError(res, ctx, 413, 'payload_too_large', 'request body is too large', { connection: 'close' });
@@ -2653,9 +2779,9 @@ export class Gateway {
     };
   }
 
-  private finish(res: ServerResponse, ctx: RequestContext): void {
+  private finish(res: ClientResponse, ctx: RequestContext): void {
     // During shutdown, a connection whose response just completed is now idle: close it rather than wait.
-    if (this.closing) this.server.closeIdleConnections();
+    if (this.closing) (this.server as http.Server).closeIdleConnections();
 
     const durationMs = performance.now() - ctx.started;
     const completed = res.writableFinished;
@@ -2678,6 +2804,7 @@ export class Gateway {
         endNs: nowNs(),
         attributes: {
           'http.request.method': ctx.method,
+          'network.protocol.version': ctx.httpVersion === '2.0' ? '2' : ctx.httpVersion,
           'url.path': path,
           'http.route': ctx.routePath,
           'http.response.status_code': status,
@@ -2696,6 +2823,7 @@ export class Gateway {
       requestId: ctx.requestId,
       traceId: ctx.trace?.traceId,
       method: ctx.method,
+      protocol: ctx.httpVersion === '2.0' ? 'h2' : `http/${ctx.httpVersion}`,
       path,
       route: ctx.route,
       status,
@@ -2725,7 +2853,7 @@ function closeSoon(socket: Duplex): void {
 }
 
 /** Resolves when the client has taken what it was sent, has gone, or has taken nothing for `stallMs`. */
-function waitForDrain(res: ServerResponse, stallMs: number): Promise<'drained' | 'closed' | 'stalled'> {
+function waitForDrain(res: ClientResponse, stallMs: number): Promise<'drained' | 'closed' | 'stalled'> {
   return new Promise((resolve) => {
     const done = (outcome: 'drained' | 'closed' | 'stalled'): void => {
       clearTimeout(timer);
@@ -2887,6 +3015,11 @@ function keepFixed(current: GatewayConfig, next: GatewayConfig): { config: Gatew
   if (config.tls && ((was === undefined) !== (will === undefined) || (was && will && was.required !== will.required))) {
     restartRequired.push('tls.clientAuth');
     config.tls = { ...config.tls, clientAuth: was && (will ? { ...will, required: was.required } : was) };
+  }
+  // Whether the listener speaks HTTP/2 decides what kind of server it is.
+  if (current.tls && config.tls && current.tls.http2 !== config.tls.http2) {
+    restartRequired.push('tls.http2');
+    config.tls = { ...config.tls, http2: current.tls.http2 };
   }
   // The admin listener is bound once; its token can change.
   const { admin } = current;
