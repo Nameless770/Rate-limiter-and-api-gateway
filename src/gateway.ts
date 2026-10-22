@@ -28,8 +28,16 @@ import { normalizeIp } from './net/ip.js';
 import { listenOn } from './net/listen.js';
 import { createLogger, type Logger } from './observability/logger.js';
 import { Registry } from './observability/metrics.js';
+import { nowNs, OtlpExporter, type SpanData } from './observability/otlp.js';
 import { registerProcessMetrics } from './observability/process.js';
-import { childOf, formatTraceparent, startOrContinue, type TraceContext } from './observability/trace.js';
+import {
+  childOf,
+  formatTraceparent,
+  isSampled,
+  newSpanId,
+  startOrContinue,
+  type TraceContext,
+} from './observability/trace.js';
 import { sanitizeRequestId, stripHopByHop } from './proxy/headers.js';
 import { UpstreamClient, UpstreamError, type UpstreamResponse } from './proxy/upstream.js';
 import {
@@ -147,6 +155,8 @@ interface Runtime {
   ipCeiling?: RouteLimiter;
   /** The TLS certificate and key, read and checked while building (TLS only). */
   tls?: TlsMaterial;
+  /** CA bundle for the trace collector's https endpoint, when one is configured. */
+  otlpCa?: Buffer;
 }
 
 /** How calls for one route are made: its own settings where it has them, its upstream's where it does not. */
@@ -204,6 +214,8 @@ interface RequestContext {
   switched?: boolean;
   /** The trace this request belongs to (unless tracing is off). */
   trace?: TraceContext;
+  /** The path prefix of the route it matched, for span names (low-cardinality, unlike the request path). */
+  routePath?: string;
 }
 
 /** What a WebSocket handshake attempt came to: a connection to join, or the upstream's own refusal to relay. */
@@ -343,6 +355,8 @@ export class Gateway {
   private readonly stopProcessMetrics: () => void;
   private listening = false;
   private closing = false;
+  /** Where finished spans go, when `tracing.otlp` is configured. A reload that changes it replaces it. */
+  private spans?: OtlpExporter;
   /** Expiry of the certificate currently being served (TLS only). */
   private certNotAfter?: Date;
   /** Responses still in progress, so shutdown can ask them not to keep their connection alive. */
@@ -417,6 +431,14 @@ export class Gateway {
     'gateway_config_reloads_total',
     'Configuration reloads, by result (ok, or error: the previous configuration stayed in force).',
   );
+  private readonly mSpansExported = this.metrics.counter(
+    'gateway_trace_spans_exported_total',
+    'Spans the trace collector accepted.',
+  );
+  private readonly mSpansDropped = this.metrics.counter(
+    'gateway_trace_spans_dropped_total',
+    'Spans not delivered to the trace collector, by why (queue_full, export_failed).',
+  );
   private readonly mLatency = this.metrics.histogram(
     'gateway_request_duration_seconds',
     'End-to-end request latency.',
@@ -433,6 +455,7 @@ export class Gateway {
     this.startedAt = this.clock();
     this.responseCache = new ResponseCache({ ...config.cache, clock: this.clock });
     this.rt = this.buildRuntime(config, undefined, 1);
+    this.spans = this.makeExporter(this.rt);
 
     this.registerGauges();
     this.stopProcessMetrics = registerProcessMetrics(this.metrics);
@@ -606,6 +629,7 @@ export class Gateway {
     for (const upstream of new Set([...this.rt.upstreams.values(), ...this.retiring])) this.closeUpstream(upstream);
     this.retiring.clear();
     await Promise.all([...this.limiterCache.values()].map(({ limiter }) => limiter.close?.()));
+    await this.spans?.close(); // the last requests' spans, bounded by the export timeout
   }
 
   /** Circuit breaker of an upstream's first target (the only one unless the upstream has several `urls`). */
@@ -691,6 +715,16 @@ export class Gateway {
     this.admin.setToken(config.admin.token);
     if (config.tls && rt.tls) this.applyTls(config.tls, rt.tls); // read and checked while building
 
+    // A different collector (or different settings, or a new CA bundle for it): a new exporter. The old one sends
+    // what it already holds on its way out.
+    const caChanged = previous.otlpCa && rt.otlpCa ? !previous.otlpCa.equals(rt.otlpCa) : previous.otlpCa !== rt.otlpCa;
+    const was = previous.config.tracing;
+    if (!same(was.otlp, config.tracing.otlp) || was.enabled !== config.tracing.enabled || caChanged) {
+      const old = this.spans;
+      this.spans = this.makeExporter(rt);
+      void old?.close();
+    }
+
     // The cache: new size limits mean a new cache. Otherwise only entries from an upstream that changed or went
     // are dropped; they may have come from a backend that is no longer the one configured.
     if (!same(previous.config.cache, config.cache)) {
@@ -771,6 +805,8 @@ export class Gateway {
       Object.entries(config.upstreams).map(([name, upstream]) => [name, readUpstreamTls(name, upstream)] as const),
     );
     const tls = config.tls ? readTlsMaterial(config.tls) : undefined;
+    const otlpCaFile = config.tracing.otlp?.caFile;
+    const otlpCa = otlpCaFile ? readFileOrFail('tracing.otlp.caFile', otlpCaFile) : undefined;
 
     const upstreams = new Map<string, UpstreamRuntime>();
     for (const [name, upstreamConfig] of Object.entries(config.upstreams)) {
@@ -818,7 +854,70 @@ export class Gateway {
       allowedMethods: new Set(config.allowedMethods),
       ipCeiling: config.rateLimit.ip ? this.limiterFor(config, IP_CEILING, config.rateLimit.ip) : undefined,
       tls,
+      otlpCa,
     };
+  }
+
+  /** The span exporter a runtime asks for: none unless tracing is on and has somewhere to send spans. */
+  private makeExporter(rt: Runtime): OtlpExporter | undefined {
+    const { tracing } = rt.config;
+    if (!tracing.enabled || !tracing.otlp) return undefined;
+    return new OtlpExporter({
+      ...tracing.otlp,
+      ca: rt.otlpCa,
+      onExported: (count) => this.mSpansExported.inc({}, count),
+      onDropped: (count, reason) => this.mSpansDropped.inc({ reason }, count),
+      onError: (error) => this.logger.warn('trace export failed; spans dropped', { error }),
+    });
+  }
+
+  /**
+   * One upstream attempt as a client span (OpenTelemetry's HTTP client conventions), from sending the request to
+   * receiving the response headers or failing. A 5xx or a failure (other than the client leaving) is an error.
+   */
+  private recordAttempt(
+    ctx: RequestContext,
+    upstream: UpstreamRuntime,
+    target: Target,
+    span: { id: string; started: number; attempt: number },
+    outcome: { status?: number; error?: string },
+  ): void {
+    if (!this.spans || !ctx.trace) return;
+    const { status, error } = outcome;
+    const failure =
+      error !== undefined
+        ? error === 'aborted'
+          ? undefined
+          : error
+        : status !== undefined && status >= 500
+          ? `status ${status}`
+          : undefined;
+    const { host, port } = target.client.address;
+    this.recordSpan(ctx.trace, {
+      spanId: span.id,
+      parentSpanId: ctx.trace.spanId,
+      name: `${ctx.method} ${upstream.name}`,
+      kind: 'client',
+      startNs: nowNs(span.started),
+      endNs: nowNs(),
+      attributes: {
+        'http.request.method': ctx.method,
+        'server.address': host,
+        'server.port': port,
+        'http.response.status_code': status,
+        'http.request.resend_count': span.attempt > 1 ? span.attempt - 1 : undefined,
+        'error.type': error ?? (status !== undefined && status >= 500 ? String(status) : undefined),
+        'gateway.upstream': upstream.name,
+        'gateway.target': target.id,
+      },
+      error: failure,
+    });
+  }
+
+  /** Hand a finished span to the exporter, if there is one and the trace is sampled. */
+  private recordSpan(trace: TraceContext | undefined, span: Omit<SpanData, 'traceId'>): void {
+    if (!this.spans || !trace || !isSampled(trace)) return;
+    this.spans.add({ traceId: trace.traceId, ...span });
   }
 
   private buildUpstream(
@@ -1182,6 +1281,7 @@ export class Gateway {
     const match = ctx.rt.router.match(url.pathname, ctx.method);
     if (!match) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
     ctx.route = match.routeId;
+    ctx.routePath = match.route.path;
 
     if (!(await this.admitted(req, res, ctx, match.route, match.routeId))) return;
 
@@ -1655,11 +1755,11 @@ export class Gateway {
     store: StoreOptions,
   ): Promise<FlightResult> {
     const response = await this.callUpstream<UpstreamResponse>(upstream, bg, policy, NEVER_ABORTED, {
-      send: (target, timeoutMs) =>
+      send: (target, timeoutMs, hop) =>
         target.client.request({
           method: 'GET',
           path: target.client.resolvePath(relativePath),
-          headers: { ...headers, host: target.client.host },
+          headers: { ...headers, ...hop, host: target.client.host },
           timeoutMs,
         }),
       status: (result) => result.status,
@@ -1699,6 +1799,25 @@ export class Gateway {
 
   private finishRefresh(bg: RequestContext, result: 'stored' | 'not_stored' | 'error', error?: unknown): void {
     this.mRefreshes.inc({ route: bg.route, result });
+    if (bg.trace) {
+      const cause =
+        error instanceof UpstreamError ? error.kind : error instanceof CircuitOpenError ? 'circuit_open' : 'error';
+      this.recordSpan(bg.trace, {
+        spanId: bg.trace.spanId,
+        parentSpanId: bg.trace.parentId,
+        name: 'cache refresh',
+        kind: 'internal',
+        startNs: nowNs(bg.started),
+        endNs: nowNs(),
+        attributes: {
+          'gateway.route': bg.route,
+          'gateway.upstream': bg.upstream,
+          'gateway.refresh_result': result,
+          'gateway.request_id': bg.requestId,
+        },
+        error: result === 'error' ? cause : undefined,
+      });
+    }
     const fields = {
       requestId: bg.requestId,
       route: bg.route,
@@ -1811,11 +1930,11 @@ export class Gateway {
     upstream.users++;
     try {
       const response = await this.callUpstream<UpstreamResponse>(upstream, ctx, policy, abort.signal, {
-        send: (target, timeoutMs) =>
+        send: (target, timeoutMs, hop) =>
           target.client.request({
             method: ctx.method,
             path: target.client.resolvePath(relativePath),
-            headers: { ...headers, host: target.client.host },
+            headers: { ...headers, ...hop, host: target.client.host },
             body,
             signal: abort.signal,
             timeoutMs,
@@ -1850,8 +1969,11 @@ export class Gateway {
     policy: RoutePolicy,
     signal: AbortSignal,
     call: {
-      /** A single attempt against `target`, to finish within `timeoutMs`. */
-      send(target: Target, timeoutMs: number): Promise<T>;
+      /**
+       * A single attempt against `target`, to finish within `timeoutMs`. `hop` holds the headers that name this
+       * attempt in the trace (its own `traceparent`), to send along with the rest.
+       */
+      send(target: Target, timeoutMs: number, hop: Record<string, string>): Promise<T>;
       status(result: T): number;
       headers(result: T): IncomingHttpHeaders;
       /** Release a result that is being replaced by another attempt. */
@@ -1879,22 +2001,27 @@ export class Gateway {
         tried.add(target);
         ctx.attempts++;
         target.pending++;
+        // Each attempt is a hop of its own in the trace, so the upstream's span hangs off the attempt that reached it.
+        const span = { id: newSpanId(), started: performance.now(), attempt: ctx.attempts };
+        const hop: Record<string, string> = ctx.trace
+          ? { traceparent: formatTraceparent({ ...ctx.trace, spanId: span.id }) }
+          : {};
         try {
-          const result = await call.send(target, Math.max(1, Math.min(timeoutMs, budgetLeftMs())));
-          const failed = call.status(result) >= 500;
+          const result = await call.send(target, Math.max(1, Math.min(timeoutMs, budgetLeftMs())), hop);
+          const status = call.status(result);
+          const failed = status >= 500;
           if (failed) permit.failure();
           else permit.success();
           this.mAttempts.inc({ upstream: upstream.name, target: target.id, outcome: failed ? 'status_5xx' : 'ok' });
+          this.recordAttempt(ctx, upstream, target, span, { status });
           return result;
         } catch (error) {
           const aborted = error instanceof UpstreamError && error.kind === 'aborted';
           if (aborted) permit.release();
           else permit.failure();
-          this.mAttempts.inc({
-            upstream: upstream.name,
-            target: target.id,
-            outcome: error instanceof UpstreamError ? error.kind : 'error',
-          });
+          const kind = error instanceof UpstreamError ? error.kind : 'error';
+          this.mAttempts.inc({ upstream: upstream.name, target: target.id, outcome: kind });
+          this.recordAttempt(ctx, upstream, target, span, { error: kind });
           throw error;
         } finally {
           target.pending--;
@@ -2008,6 +2135,7 @@ export class Gateway {
       const ws = match?.route.websocket;
       if (!match || !ws) return this.sendError(res, ctx, 404, 'route_not_found', 'no route matches this request');
       ctx.route = match.routeId;
+      ctx.routePath = match.route.path;
 
       const handshake = validateHandshake(req);
       if (!handshake.ok) {
@@ -2046,10 +2174,10 @@ export class Gateway {
       held = upstream;
       upstream.users++;
       const result = await this.callUpstream<UpgradeResult>(upstream, ctx, policy, abort.signal, {
-        send: async (target, timeoutMs) => {
+        send: async (target, timeoutMs, hop) => {
           const outcome = await target.client.upgrade({
             path: target.client.resolvePath(relativePath),
-            headers: { ...headers, host: target.client.host },
+            headers: { ...headers, ...hop, host: target.client.host },
             signal: abort.signal,
             timeoutMs,
           });
@@ -2536,12 +2664,38 @@ export class Gateway {
     this.mRequests.inc({ route: ctx.route, status });
     this.mLatency.observe(durationMs / 1000, { route: ctx.route });
     if (ctx.cache) this.mCache.inc({ route: ctx.route, result: ctx.cache });
+    // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
+    const path = ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path;
+    if (ctx.trace) {
+      // OpenTelemetry's HTTP server conventions. The route's prefix names the span; the raw path is an attribute.
+      this.recordSpan(ctx.trace, {
+        spanId: ctx.trace.spanId,
+        parentSpanId: ctx.trace.parentId,
+        name: ctx.routePath ? `${ctx.method} ${ctx.routePath}` : ctx.method,
+        kind: 'server',
+        startNs: nowNs(ctx.started),
+        endNs: nowNs(),
+        attributes: {
+          'http.request.method': ctx.method,
+          'url.path': path,
+          'http.route': ctx.routePath,
+          'http.response.status_code': status,
+          'gateway.route': ctx.route,
+          'gateway.request_id': ctx.requestId,
+          'gateway.upstream': ctx.upstream,
+          'gateway.client': ctx.client,
+          'gateway.cache': ctx.cache,
+          'gateway.rate_limited': ctx.rateLimited || undefined,
+          'gateway.auth_failure': ctx.authFailure,
+        },
+        error: status >= 500 ? `status ${status}` : undefined,
+      });
+    }
     this.logger.info('request', {
       requestId: ctx.requestId,
       traceId: ctx.trace?.traceId,
       method: ctx.method,
-      // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
-      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path,
+      path,
       route: ctx.route,
       status,
       durationMs: Math.round(durationMs * 10) / 10,

@@ -18,6 +18,13 @@ export interface TraceContext {
   state?: string;
   /** The trace came from the caller (as opposed to being started here). */
   continued: boolean;
+  /** The span this hop hangs off: the caller's span for a continued trace, or the request that set off background work. */
+  parentId?: string;
+}
+
+/** The trace's sampled flag: whether whoever records spans (the gateway's exporter, the services behind) should. */
+export function isSampled(trace: TraceContext): boolean {
+  return (Number.parseInt(trace.flags, 16) & 0x01) === 1;
 }
 
 export interface Traceparent {
@@ -71,12 +78,13 @@ function randomHex(bytes: number): string {
 
 /**
  * The trace a request belongs to: the caller's when it sent a valid one and the caller is trusted to, otherwise a new
- * one. A new trace is marked sampled, which is what the services behind would decide for themselves if the gateway
- * sent nothing (a parent saying "not sampled" would switch their tracing off).
+ * one. A continued trace keeps the caller's sampling decision. A new one is sampled at `sampleRatio` (default: all of
+ * them, which is what the services behind would decide for themselves if the gateway sent nothing), and the decision
+ * goes downstream in the flags, so the gateway and the services record the same traces.
  */
 export function startOrContinue(
   headers: Record<string, string | string[] | undefined>,
-  options: { trustIncoming: boolean },
+  options: { trustIncoming: boolean; sampleRatio?: number },
 ): TraceContext {
   const incoming = options.trustIncoming ? parseTraceparent(headers['traceparent']) : undefined;
   if (incoming) {
@@ -86,14 +94,37 @@ export function startOrContinue(
       flags: incoming.flags,
       state: usableState(headers['tracestate']),
       continued: true,
+      parentId: incoming.parentId,
     };
   }
-  return { traceId: randomHex(16), spanId: randomHex(8), flags: '01', continued: false };
+  const traceId = randomHex(16);
+  return {
+    traceId,
+    spanId: randomHex(8),
+    flags: sampledAt(traceId, options.sampleRatio ?? 1) ? '01' : '00',
+    continued: false,
+  };
 }
 
-/** A further hop in the same trace: work a request set off (a background refresh) shows up beside it. */
+/**
+ * Sampling by trace id, as OpenTelemetry's ratio sampler does: the id's last 8 hex digits, read as a fraction of 2^32,
+ * against the ratio. Trace ids are random, so this keeps that share of traces, and it is the same answer every time
+ * for the same trace.
+ */
+export function sampledAt(traceId: string, ratio: number): boolean {
+  if (ratio >= 1) return true;
+  if (ratio <= 0) return false;
+  return Number.parseInt(traceId.slice(-8), 16) / 2 ** 32 < ratio;
+}
+
+/** A new span id: one per upstream attempt, so each shows up as its own hop. */
+export function newSpanId(): string {
+  return randomHex(8);
+}
+
+/** A further hop in the same trace: work a request set off (a background refresh) shows up beneath it. */
 export function childOf(trace: TraceContext): TraceContext {
-  return { ...trace, spanId: randomHex(8) };
+  return { ...trace, spanId: randomHex(8), parentId: trace.spanId };
 }
 
 export function formatTraceparent(trace: TraceContext): string {

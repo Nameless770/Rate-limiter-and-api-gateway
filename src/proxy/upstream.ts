@@ -97,6 +97,12 @@ export class UpstreamClient {
     return this.target.host;
   }
 
+  /** The target's host name and port (the scheme's default when the URL has none), as spans describe a server. */
+  get address(): { host: string; port: number } {
+    const port = Number(this.target.port) || (this.target.protocol === 'https:' ? 443 : 80);
+    return { host: this.target.hostname.replace(/^\[(.*)\]$/, '$1'), port };
+  }
+
   /** The upstream's own base path joined with the request path: base "/api/v1" + "/users" -> "/api/v1/users". */
   resolvePath(pathWithQuery: string): string {
     const base = this.target.pathname.replace(/\/+$/, '');

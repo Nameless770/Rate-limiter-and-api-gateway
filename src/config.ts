@@ -540,6 +540,40 @@ export const configSchema = z
          * for every request, so a client cannot attach its requests to your traces (or flood one of them).
          */
         trustIncoming: z.boolean().default(true),
+        /**
+         * Share of traces started here that are sampled (recorded), from 0 to 1. A trace continued from a caller keeps
+         * the caller's decision. The decision travels downstream in `traceparent`, so services record the same ones.
+         */
+        sampleRatio: z.number().min(0).max(1).default(1),
+        /**
+         * Record spans (one per request, one per upstream attempt, one per background cache refresh) and send them to
+         * an OpenTelemetry collector over OTLP/HTTP (JSON). Without it the gateway passes trace context on but records
+         * nothing itself.
+         */
+        otlp: z
+          .strictObject({
+            /** The collector's traces endpoint, e.g. http://otel-collector:4318/v1/traces. */
+            endpoint: httpUrl,
+            /** Extra headers on every export, e.g. a vendor's API key: use ${ENV_VAR}. */
+            headers: z.record(z.string().min(1), z.string()).default({}),
+            /** PEM bundle for an https endpoint signed by a private CA. */
+            caFile: z.string().min(1).optional(),
+            serviceName: z.string().min(1).default('api-gateway'),
+            /** Most spans per export request. */
+            batchSize: positiveInt.max(10_000).default(512),
+            /** Queued spans are sent at least this often. */
+            flushIntervalMs: positiveInt.default(5_000),
+            /** Most spans waiting to be sent. Beyond it new ones are dropped (and counted), never buffered without bound. */
+            maxQueueSpans: positiveInt.default(4_096),
+            /** An export taking longer than this is abandoned and its spans dropped. */
+            timeoutMs: positiveInt.default(10_000),
+          })
+          .superRefine((otlp, ctx) => {
+            if (otlp.caFile && !otlp.endpoint.startsWith('https://')) {
+              ctx.addIssue({ code: 'custom', path: ['caFile'], message: 'caFile requires an https:// endpoint' });
+            }
+          })
+          .optional(),
       })
       .prefault({}),
 

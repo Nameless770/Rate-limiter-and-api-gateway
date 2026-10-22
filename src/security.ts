@@ -63,6 +63,17 @@ export function securityNotes(config: GatewayConfig): string[] {
     }
   }
 
+  const otlp = config.tracing.enabled ? config.tracing.otlp : undefined;
+  if (otlp?.endpoint.startsWith('http://')) {
+    const host = new URL(otlp.endpoint).hostname.replace(/^\[(.*)\]$/, '$1');
+    if (!isLoopbackHost(host)) {
+      notes.push(
+        `trace spans go to "${host}" over plain HTTP. They carry request paths, route names and the names of ` +
+          'authenticated callers; use an https:// collector endpoint outside a trusted private network.',
+      );
+    }
+  }
+
   for (const route of config.routes) {
     const ws = route.websocket;
     if (!ws) continue;
