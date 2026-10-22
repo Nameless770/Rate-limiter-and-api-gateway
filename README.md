@@ -2,20 +2,20 @@
 
 A small API gateway that sits in front of other HTTP services and handles the cross-cutting concerns:
 
-- **Per-key rate limiting** with a token bucket, an exact sliding window or an approximate (O(1)-memory) sliding-window counter, implemented from scratch and backed by Redis so the limit is shared by every gateway instance
+- **Per-key rate limiting** with a token bucket, an exact sliding window or an approximate (O(1)-memory) sliding-window counter, implemented from scratch and backed by Redis (one server, Sentinel or Cluster) so the limit is shared by every gateway instance
 - **API keys with plans**, per-key overrides, and a per-address ceiling so rotating key values doesn't buy a fresh budget
-- **Authentication per route**: registered API keys and signed JWTs (HS256 / RS256 / ES256), verified by the gateway, with a trusted identity passed to the upstream
+- **Authentication per route**: registered API keys, signed JWTs (HS256 / RS256 / ES256) and TLS client certificates, verified by the gateway, with a trusted identity passed to the upstream
 - **Routing** by path prefix, with prefix stripping and per-route timeouts, retries, body limits, rate limits and caching
 - **Response caching** with HTTP-correct freshness rules, stampede protection, a defence against cache poisoning, and stale copies served while revalidating or while the upstream is failing
 - **Load balancing** across several targets per upstream, each with its own circuit breaker
 - **Retries** with exponential backoff and full jitter
 - **Circuit breaking** per target, so a failing instance gets room to recover and callers fail fast
 - **Active health checks**, so traffic avoids a down target before any client request has to fail to find out
-- **TLS** facing clients (renewals picked up without a restart) and towards upstreams (private CAs, client certificates)
-- **WebSocket proxying** with origin checks, authentication and connection limits
+- **TLS** facing clients (renewals picked up without a restart, client certificates) and towards upstreams (private CAs, client certificates), and **HTTP/2** for clients that offer it
+- **WebSocket proxying** with origin checks, authentication, connection limits and limits on each message a client sends
 - **Cluster mode** to use every core of a machine, with the rate limits still shared through Redis
 - **Configuration reloads** without a restart or a dropped request, all or nothing
-- **Trace context**: a W3C `traceparent` on every forwarded request, and the trace id in the access log
+- **Tracing**: W3C trace context on every forwarded request, and spans exported to an OpenTelemetry collector
 
 Written in TypeScript on Node's built-in `http`. The only runtime dependencies are `ioredis` (the Redis client) and `zod` (config validation). The rate limiters, circuit breaker, retry loop, balancer and cache are hand-written.
 
@@ -83,8 +83,23 @@ The algorithms are pure functions in [`src/ratelimit/algorithms.ts`](src/ratelim
 - **Atomic.** Each check-and-update is a single Lua script ([`src/ratelimit/redis.ts`](src/ratelimit/redis.ts)). There is no read-then-write window for two instances to interleave in, so N concurrent requests against a limit of L admit exactly L (the Redis integration tests assert this from several independent clients).
 - **One clock.** Scripts use Redis `TIME`, not the gateway's clock, so instances with skewed clocks still agree on when a window ends.
 - **Bounded storage.** Every key gets a TTL; idle clients cost nothing. Denied requests do not write, so a flood of rejections can't amplify into Redis writes.
-- **Cluster-safe.** Each script touches exactly one key.
+- **Cluster-safe.** Each script touches exactly one key, so it runs unchanged on a Redis Cluster, wherever the key's slot lives (see "Redis deployments").
 - **Credentials aren't stored.** API keys are SHA-256 hashed before they become Redis keys.
+
+### Redis deployments
+
+`redis` takes exactly one of three ways to reach it:
+
+```jsonc
+"redis": { "url": "rediss://:secret@redis.internal:6380" }                                   // one server
+"redis": { "sentinel": { "name": "gw", "nodes": ["s1:26379", "s2:26379", "s3:26379"] },     // a primary watched by Sentinel
+           "password": "${REDIS_PASSWORD}", "tls": true }
+"redis": { "cluster": { "nodes": ["n1:7000", "n2:7001", "n3:7002"] }, "password": "${REDIS_PASSWORD}" }  // a Redis Cluster
+```
+
+- **Sentinel.** The gateway asks the sentinels where the primary is, hears about a failover the moment they announce it, and reconnects when a demoted primary refuses writes (`READONLY`). While it switches, the failure mode below applies, so requests are still answered. The integration test forces a failover in the middle of traffic: every request is answered (never a 5xx), and decisions are back on the shared budget, on the new primary, within about two seconds. (`sentinel.password` is the sentinels' own password; `password` is the data nodes'.)
+- **Cluster.** The gateway reads the slot map from any seed node it can reach and sends each key to the node that owns it. A flood of concurrent requests over keys spread across three nodes admits exactly the limit for each key, as on one server.
+- With `sentinel` or `cluster`, `username`, `password` and `tls` apply to every node (with `url` they belong in the URL). The fail-fast settings are the same everywhere: no offline queue, no command retries, `commandTimeoutMs` per command. `REDIS_URL` in the environment names one server and replaces a Sentinel or Cluster setup. The health report says which mode is in use (`redisMode`).
 
 ### Who is a "client"? Keys, plans, and the address ceiling
 
@@ -253,11 +268,34 @@ By default the gateway checks no credentials: an API key only picks a rate-limit
 ]
 ```
 
-- **Methods.** `api-key` needs a key from the registry (`rateLimit.apiKeys`); `jwt` needs a bearer token from a configured issuer. With `required: true` (the default) a request with neither gets a 401 and a `WWW-Authenticate` challenge; with `required: false` anonymous callers pass, but **a credential that is presented and wrong is always refused**, so an expired token never silently becomes "logged out" and a client can't probe tokens for free.
+- **Methods.** `api-key` needs a key from the registry (`rateLimit.apiKeys`); `jwt` needs a bearer token from a configured issuer; `client-cert` needs a TLS client certificate (see "Client certificates" below). With `required: true` (the default) a request with none gets a 401 and a `WWW-Authenticate` challenge; with `required: false` anonymous callers pass, but **a credential that is presented and wrong is always refused**, so an expired token never silently becomes "logged out" and a client can't probe tokens for free.
 - **The authenticated identity is what gets rate limited.** A JWT subject has one budget however many tokens it mints, an issuer's `plan` scales it, and the same subject at two issuers is two identities. Failed attempts count against the per-address ceiling, which is checked *before* any credential is examined, so guessing keys or tokens is throttled at the price of one counter update.
 - **The upstream is told who the caller is** in `X-Authenticated-Client`, `X-Authenticated-Method` and (for JWTs) `X-Authenticated-Issuer`. These headers are **always stripped from incoming requests**, on every route, and set only from a credential the gateway verified itself, so an upstream can trust them. Subjects are free text, so anything outside printable ASCII is percent-encoded rather than allowed to split the header block.
 - **`forwardCredentials: false`** withholds only the credential the gateway consumed. Other schemes in `Authorization` (Basic, an opaque token meant for the upstream) pass through untouched, and routes without `auth` never have credentials touched.
 - **Caching** an authenticated route keeps one entry per credential, and the token is verified on every request, hit or miss: an expired token gets nothing from the cache.
+
+### Client certificates
+
+With TLS on, the listener can ask callers for a certificate (mutual TLS), and routes can accept it as a credential:
+
+```jsonc
+"tls": {
+  "certFile": "...", "keyFile": "...",
+  "clientAuth": {
+    "caFile": "/etc/gateway/callers-ca.pem",   // only certificates this CA issued count (never the system's CAs)
+    "crlFile": "/etc/gateway/callers-crl.pem", // optional: revoked ones don't
+    "allowedNames": ["billing", "reports"],    // optional: only these subject common names
+    "required": false                          // true: no valid certificate, no TLS handshake, on any route
+  }
+},
+"routes": [{ "path": "/internal", "upstream": "internal", "auth": { "methods": ["client-cert"] } }]
+```
+
+- OpenSSL checks the certificate against `caFile` and the revocation list during the handshake; the route then asks whether it passed. A certificate that was presented and did not (revoked, expired, issued by another CA, a name not in `allowedNames`, no single common name) is refused with 401, even on a route where a valid API key would also do, and the reason (`client_cert_cert_revoked`, ...) is logged.
+- The caller is named by the certificate's subject common name, and its **rate-limit identity is the issuer and subject together**: a renewed certificate keeps its budget, and another trusted CA issuing the same name is a different caller.
+- The upstream is told `X-Authenticated-Method: client-cert`, the name, the issuer's name, and the certificate's SHA-256 fingerprint in `X-Client-Cert-Sha256` (stripped from incoming requests, like the rest).
+- With `required: false` the certificate is asked for but optional at the TLS level, so routes without `client-cert` are unaffected. Browsers with client certificates installed may then offer one; a `required: true` listener is for service-to-service traffic.
+- The CA bundle and revocation list are read and checked at start-up and on every reload, and a reload applies them to new connections (a new CRL is how you revoke without a restart). Turning `clientAuth` on or off, or changing `required`, needs a restart.
 
 ### How JWTs are verified
 
@@ -302,6 +340,9 @@ What the gateway defends, and how. Everything here has a test; the table points 
 | A web page making a browser reconfigure the gateway (`POST 127.0.0.1:9090/_gateway/reload`) | Reload is `POST` only, behind the admin token, and refused when the request carries a browser's `Origin` or `Sec-Fetch-Site` | `gateway.reload.test.ts` |
 | A broken file taking the gateway down on reload | Reloads are all or nothing: the whole configuration and every file it names are checked before anything is swapped | `gateway.reload.test.ts`, `reload.e2e.test.ts` |
 | Clients steering or flooding your traces | Strict `traceparent` validation; `tracestate` length-capped and forwarded only with its own trace; `trustIncoming: false` at an untrusted edge | `trace.test.ts`, `gateway.trace.test.ts` |
+| Lookalike or revoked client certificates | Only `tls.clientAuth.caFile` is trusted, revocation list honoured, a bad certificate refused even beside a valid key; identity is issuer and subject together | `gateway.clientCert.test.ts` |
+| Oversized, floods of, or malformed WebSocket messages | `maxMessageBytes` and `messageRate` per connection, checked on each frame header before the frame is relayed; protocol violations closed with 1002 | `wsFrames.test.ts`, `gateway.wsLimits.test.ts` |
+| One HTTP/2 connection taking everything; stalled streams | `maxConcurrentStreams` per connection with every stream under `maxInFlight`; a deadline per stream; a stalled reader's stream reset, not its connection | `gateway.http2.test.ts` |
 
 Startup prints a `security` log line for each risky-but-legal setting (header-keyed limits with no registry or ceiling, plaintext Redis off-box, a cache with no `varyHeaders`, an admin listener bound off loopback).
 
@@ -322,6 +363,15 @@ The proxy listener can terminate TLS itself, so the gateway can face clients dir
 - **Expiry is visible.** `gateway_tls_certificate_expiry_seconds` goes negative when the certificate has lapsed (alert on it); the gateway logs a warning under 14 days and an error once expired, at startup and on every reload.
 - **`X-Forwarded-Proto`** tells the upstream the truth: `https` for clients on this listener. `hstsMaxAgeSeconds` adds `Strict-Transport-Security`; leave it unset until you are certain every client can use HTTPS.
 - The admin listener stays plain HTTP on loopback; its bearer token is not meant to cross a network.
+- **Client certificates** can be asked for and used to authenticate callers (`clientAuth`; see "Authentication").
+
+**HTTP/2.** With `"http2": true` the listener speaks HTTP/2 to clients that offer it during the TLS handshake (ALPN) and HTTP/1.1, WebSocket upgrades included, on the same port to the rest. Every request takes the same pipeline whichever protocol it came in on; upstreams are still called over HTTP/1.1. Where the protocols differ:
+
+- One connection carries many requests at once, up to `limits.maxConcurrentStreams` (100), announced in its SETTINGS; each request still counts toward `maxInFlight`. A reload applies a new limit to new connections.
+- HTTP/2 has no `Connection` header. Where HTTP/1.1 would close the connection after refusing an upload, the stream is reset once the response is complete (NO_ERROR, which tells the client to stop sending); the connection and its other requests carry on.
+- A response abandoned part-way resets its stream with an error code: `CANCEL` for a client that stopped reading, `INTERNAL_ERROR` for an upstream that died mid-body. Never `NO_ERROR`, which a client reads as a normal end: a truncated body must not pass for a whole one.
+- `limits.requestTimeoutMs` cancels a request not finished in time (just that stream). An idle connection is closed with GOAWAY after `keepAliveTimeoutMs`; shutdown sends GOAWAY to every connection, lets the requests in progress finish, and cuts what is left after `shutdownGraceMs`.
+- The access log has `protocol` (`h2` or `http/1.1`), and `gateway_http2_connections` counts HTTP/2 connections. Turning `http2` on or off needs a restart.
 
 **Towards upstreams.** An `https://` upstream is verified against Node's default CAs, or only against `tls.caFile` for one signed by a private CA; there is deliberately no option to skip verification. For an upstream that only accepts callers it can identify, the gateway presents a client certificate (mutual TLS):
 
@@ -346,7 +396,9 @@ A route proxies WebSocket connections only if it asks to:
     "allowedOrigins": ["https://app.example.com"],
     "idleTimeoutMs": 60000,
     "maxDurationMs": 3600000,
-    "maxConnections": 1000
+    "maxConnections": 1000,
+    "maxMessageBytes": 65536,
+    "messageRate": { "perSecond": 20, "burst": 50 }
   }
 }
 ```
@@ -355,20 +407,25 @@ A route proxies WebSocket connections only if it asks to:
 
 1. **Shape.** `GET`, `Upgrade: websocket` (and nothing else: `h2c` and every other protocol upgrade is refused, because they would let a client talk to the upstream in ways none of these checks saw), version 13, a well-formed key, no body. Anything else is a `400`/`405`/`426` and never reaches the upstream. A route without `websocket` answers `404` to an upgrade.
 2. **Origin.** A browser attaches the user's cookies to a WebSocket opened by *any* page on *any* site, and the `Origin` header is the only thing that says which site that was (a page cannot forge it). Without a check, a page on `evil.example` can open a socket to your service as your logged-in user: cross-site WebSocket hijacking. The `Origin` must be in `allowedOrigins` (exact match, case-insensitive; `Origin: null` and a repeated header are refused). Clients that send no `Origin` are scripts and native apps, not browsers, and are admitted. `allowAnyOrigin` opts out and the startup log says so. This runs *before* authentication and rate limiting, so a hostile page can neither burn a user's quota nor probe credentials.
-3. **Address ceiling, authentication, route rate limit** (with the route's `cost`), exactly as for HTTP. Opening a connection spends from the budget; messages on an open connection do not (see below).
+3. **Address ceiling, authentication, route rate limit** (with the route's `cost`), exactly as for HTTP. Opening a connection spends from the budget; messages on an open connection do not (they have `messageRate` instead; see below).
 4. **Capacity.** `maxConnections` per route and the global in-flight limit answer `503` rather than queueing.
 
 Browsers cannot set `Authorization` or `X-API-Key` on a `new WebSocket(...)`, so header credentials suit servers and native clients. For a browser page, authenticate with a cookie at the upstream (a route without `auth`, or `required: false`), and rely on `allowedOrigins` to keep other sites out.
 
 **The upstream's side.** The handshake is sent with the gateway's own forwarding headers and verified identity (client-supplied `X-Authenticated-*` are stripped, as always), and balanced, retried and circuit-broken like a `GET`: a refused connection moves to the next target, a `503` is retried per the retry policy, an upstream that answers with an ordinary refusal (a `401`, a `404`) has its status, headers and body relayed. The upstream's `101` is not taken on trust: the `Sec-WebSocket-Accept` must match the client's key, and it may only select a subprotocol the client offered and an extension the client asked for; otherwise the connection is refused with `502`, counted as an upstream failure and not retried.
 
-**After the `101`, the gateway moves bytes and does not read frames.** Subprotocols and extensions such as `permessage-deflate` are negotiated end to end. The consequences:
+**After the `101`, frames are relayed byte for byte.** The gateway reads each frame's header as it passes (where frames begin and end, how big each message is), never its payload, which is neither decoded nor altered. Subprotocols and extensions such as `permessage-deflate` are negotiated end to end. What it enforces:
 
-- It **cannot rate limit individual messages**; the controls are who may connect, how many at once (`maxConnections`), how long a quiet connection lives (`idleTimeoutMs`: no traffic in either direction, so ping/pong keeps a healthy one alive) and how long any connection lives (`maxDurationMs`). If the upstream needs per-message limits, it has to apply them.
+- **Per-message limits on the client** (the upstream's messages are not held to them):
+  - `maxMessageBytes`: the largest message, in payload bytes, all frames of a fragmented message counted. With `permessage-deflate` negotiated this is the compressed size; the upstream must still bound what a message inflates to.
+  - `messageRate`: messages (pings included) per connection, `perSecond` on average and `burst` at once.
+  - The RFC's rules for client frames: masked, a known opcode, control frames whole and at most 125 bytes, continuations only inside a message, a sane 64-bit length.
+  - A client that breaks one is stopped **before any byte of the offending frame reaches the upstream**. The upstream gets a close frame with the code: `1009` message too big, `1008` too many messages, `1002` protocol error. The client gets the upstream's remaining replies to its earlier messages, then the gateway's close frame with the same code in place of the upstream's own (or at the next frame boundary after a second, if the upstream does not answer).
+- **Connections:** who may open one, how many at once (`maxConnections`), how long a quiet one lives (`idleTimeoutMs`: no traffic in either direction, so ping/pong keeps a healthy one alive) and how long any lives (`maxDurationMs`).
 - A peer that hangs up and never finishes closing is cut off after a second; neither the HTTP header and request timeouts nor keep-alive settings apply to an upgraded connection.
 - **Shutdown does not drain** them (there is no response to wait for): open connections are closed immediately and their clients reconnect, to another instance in a fleet.
 
-Observability: the handshake is one access-log line with status `101`; when the connection ends, a `websocket closed` line has the reason (`client`, `upstream`, `idle`, `max_duration`, `shutdown`, `error`), lifetime and bytes each way. Metrics: `gateway_websocket_connections`, `gateway_websocket_closed_total{reason}` and `gateway_websocket_bytes_total{direction}`.
+Observability: the handshake is one access-log line with status `101`; when the connection ends, a `websocket closed` line has the reason (`client`, `upstream`, `idle`, `max_duration`, `shutdown`, `error`, `message_too_large`, `message_rate`, `protocol_error`), lifetime and bytes each way. Metrics: `gateway_websocket_connections`, `gateway_websocket_closed_total{reason}` and `gateway_websocket_bytes_total{direction}`.
 
 ## Scaling across cores
 
@@ -425,21 +482,25 @@ To try a configuration before deploying it, `node dist/index.js gateway.config.j
 | root | `forwardedHost` | unset | The `X-Forwarded-Host` sent upstream when the gateway is the edge |
 | `admin` | `enabled`, `host`, `port`, `token` | `true`, `127.0.0.1`, `9090`, unset | Health, metrics and reload listener. A non-loopback `host` requires a `token` (16+ chars) |
 | `cluster` | `workers` | `1` | Worker processes (a number, or `"auto"` for one per core; `WORKERS` overrides). More than one requires `redis`; see "Scaling across cores" |
-| `tls` | `certFile`, `keyFile`, `passphrase`, `minVersion`, `hstsMaxAgeSeconds` | off; `TLSv1.2`; unset | Terminate TLS on the proxy listener (see "TLS") |
-| `redis` | `url`, `keyPrefix`, `commandTimeoutMs`, `caFile` | `-`, `gw:`, `100`, unset | Omit the section for in-memory limiting. `rediss://` for TLS; `caFile` for a private CA |
+| `tls` | `certFile`, `keyFile`, `passphrase`, `minVersion`, `hstsMaxAgeSeconds`, `http2` | off; `TLSv1.2`; unset; `false` | Terminate TLS on the proxy listener, and optionally speak HTTP/2 (see "TLS") |
+| `tls.clientAuth` | `caFile`, `crlFile`, `allowedNames`, `required` | off; unset; any; `false` | Ask callers for certificates, for routes using `client-cert` (see "Client certificates") |
+| `redis` | `url` **or** `sentinel` (`name`, `nodes`, `password`) **or** `cluster` (`nodes`) | `-` | Omit the section for in-memory limiting. See "Redis deployments" |
+| `redis` | `username`, `password`, `tls`, `keyPrefix`, `commandTimeoutMs`, `caFile` | unset, unset, `false`, `gw:`, `100`, unset | Credentials and TLS for sentinel/cluster nodes (with `url`, put them in the URL: `rediss://`); `caFile` for a private CA |
 | `rateLimit` | `identityHeader` | `x-api-key` | Header carrying the API key |
 | `rateLimit` | `trustedProxyHops` | `0` | Take the Nth-from-right `X-Forwarded-For` entry |
 | `rateLimit` | `failureMode` | `local` | `local`, `open` or `closed` |
 | `rateLimit` | `default`, `ip` | none | Default rule for routes; per-address ceiling across routes |
 | `rateLimit` | `apiKeys`, `plans`, `requireKey`, `anonymousMultiplier` | `[]`, `{}`, `false`, `1` | Key registry (see above) |
 | `auth` | `jwt.issuers[]`, `forwardIdentity`, `forwardCredentials` | none, `true`, `true` | Token verification and what the upstream is told. Issuer: `name`, `alg`, `secret` / `publicKey` / `publicKeyFile`, `kid`, `issuer`, `audience`, `leewaySeconds` (30), `maxLifetimeSeconds`, `plan` |
-| `routes[].auth` | `methods`, `required` | none, `true` | `["jwt"]`, `["api-key"]` or both; see "Authentication" |
+| `routes[].auth` | `methods`, `required` | none, `true` | Any of `"jwt"`, `"api-key"`, `"client-cert"`; see "Authentication" |
 | `rateLimit` | `ipv6Prefix` | `64` | IPv6 grouping |
 | `limits` | `maxConnections`, `maxConnectionsPerIp` | `10000`, `0` (off) | Connection caps. The per-address cap is off by default because a load balancer opens every connection from one address; set it when clients connect to the gateway directly |
 | `limits` | `maxInFlight`, `maxBufferedBytes` | `2000`, 64 MiB | Load shedding (503) |
-| `limits` | `maxHeaderBytes`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs` | `16384`, `15000`, `60000`, `65000` | Protocol limits |
+| `limits` | `maxHeaderBytes`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs` | `16384`, `15000`, `60000`, `65000` | Protocol limits (on HTTP/2 too: header block size, per-stream request deadline, idle connection) |
+| `limits` | `maxConcurrentStreams` | `100` | HTTP/2 only: requests one connection may have in progress at once |
 | `limits` | `responseStallTimeoutMs` | `30000` | Drop a client that has taken none of its response for this long (see "Behaviour at the edges") |
-| `tracing` | `enabled`, `trustIncoming` | `true`, `true` | W3C trace context (see "Observability"). `trustIncoming: false` starts a new trace for every request, for an edge facing clients you don't trust |
+| `tracing` | `enabled`, `trustIncoming`, `sampleRatio` | `true`, `true`, `1` | W3C trace context (see "Observability"). `trustIncoming: false` starts a new trace for every request, for an edge facing clients you don't trust |
+| `tracing.otlp` | `endpoint`, `headers`, `caFile`, `serviceName`, `batchSize`, `flushIntervalMs`, `maxQueueSpans`, `timeoutMs` | off; `{}`; unset; `api-gateway`; `512`; `5000`; `4096`; `10000` | Export spans to an OpenTelemetry collector (OTLP/HTTP, JSON) |
 | `upstreams.*` | `url` **or** `urls`, `balance` | `-`, `round-robin` | One backend, or several |
 | `upstreams.*` | `timeoutMs`, `totalTimeoutMs` | `5000`, unset | Per-attempt and overall timeouts |
 | `upstreams.*.tls` | `caFile`, `certFile`, `keyFile`, `passphrase` | unset | `caFile`: PEM bundle for a privately signed `https://` upstream, replacing the default trust store for that upstream. `certFile` and `keyFile`: a client certificate to present to it (mutual TLS; see "TLS") |
@@ -449,6 +510,7 @@ To try a configuration before deploying it, `node dist/index.js gateway.config.j
 | `routes[]` | `path`, `upstream`, `id`, `methods`, `stripPrefix`, `rateLimit`, `cost`, `cache` | `cost`: `1` | Longest whole-segment prefix wins; `rateLimit: false` disables limiting; `cost` is what a request spends of the budget |
 | `routes[]` | `timeoutMs`, `totalTimeoutMs`, `retry`, `maxBodyBytes` | the upstream's, or the global `maxBodyBytes` | Per-route policy (see "Retries, balancing and the circuit breaker"). `retry` takes any of the upstream's retry settings; each one given replaces the upstream's |
 | `routes[].websocket` | `allowedOrigins`, `allowAnyOrigin`, `idleTimeoutMs`, `maxDurationMs`, `maxConnections` | `[]`, `false`, `60000`, unset, `1000` | Proxy WebSocket upgrades on this route (see "WebSockets"). Off unless present; cannot be combined with `cache` |
+| `routes[].websocket` | `maxMessageBytes`, `messageRate` (`perSecond`, `burst`) | unset (no limit) | Limits on each message a client sends; `burst` defaults to `perSecond` rounded up |
 | `routes[].cache` | `ttlMs`, `varyHeaders`, `forwardHeaders`, `staleWhileRevalidateMs`, `staleIfErrorMs` | `-`, `[authorization, x-api-key]`, `[accept, accept-language]`, `0`, `0` | See "Serving stale" and "Cache poisoning" |
 
 ### Reloading without a restart
@@ -465,7 +527,7 @@ The file is read again exactly as at start-up, environment overrides included, a
 - **Upstreams** whose settings and certificate files didn't change are kept as they are, with their connections, circuit breakers and health verdicts. One that changed is replaced: its requests in flight finish on the old connections, which close after the last one; its cached responses are dropped; its health checks stop as the new one's start.
 - **Rate limits.** API keys, plans and overrides apply from the next request (a withdrawn key stops working at once). A rule that didn't change keeps its counts. A changed rule starts afresh in memory; in Redis its counts carry over and are read under the new rule (as during a rolling deploy), unless the algorithm itself changed.
 - **The cache** is kept, unless its size limits changed.
-- **Some settings need a restart**, because they belong to something bound once: `port`, `host`, `redis`, `cluster`, the admin listener's address (its `token` does change), turning TLS on or off (the certificate, `minVersion` and HSTS do change) and `limits.maxHeaderBytes`. A reload keeps their running values, applies everything else, and lists them under `restartRequired` and in the log.
+- **Some settings need a restart**, because they belong to something bound once: `port`, `host`, `redis`, `cluster`, the admin listener's address (its `token` does change), turning TLS on or off (the certificate, `minVersion` and HSTS do change), turning `tls.http2` on or off, turning `tls.clientAuth` on or off or changing its `required` (its CA bundle, revocation list and allowed names do change) and `limits.maxHeaderBytes`. A reload keeps their running values, applies everything else, and lists them under `restartRequired` and in the log.
 - **In cluster mode** the primary checks the file once, then every worker reloads on its own; the answer has each worker's result, and is `200` only if every one succeeded.
 - **The endpoint takes `POST` only**, needs the admin token when one is set, and refuses any request a browser sent (one carrying `Origin` or `Sec-Fetch-Site`): otherwise any web page could make its visitor's browser post to `127.0.0.1:9090`.
 
@@ -487,9 +549,22 @@ Served by the **admin listener** (default `127.0.0.1:9090`), not the proxy port:
   - cache outcomes and size, stale copies served and background refreshes; upstream attempts by target and outcome; circuit state and transitions per target; health-check verdict (`gateway_target_healthy`), probe results and verdict changes;
   - connections, in-flight requests, buffered request bytes;
   - configuration reloads by result, and the generation in force;
+  - HTTP/2 connections; spans exported to, and dropped on the way to, the trace collector;
   - process RSS, heap, external memory, CPU seconds, and event-loop delay.
-- One JSON access-log line per request with `requestId`, `traceId`, route, status, duration, cache result, attempt count and the registered key *name* (never the key). `X-Request-Id` is propagated upstream (client-supplied ids are accepted only if they're safe to log).
-- **Trace context** ([W3C](https://www.w3.org/TR/trace-context/)). Every forwarded request, WebSocket handshakes and background cache refreshes included, carries a `traceparent` naming the gateway's hop as the parent: the caller's trace continued if it sent a valid one, otherwise a new one. The caller's `tracestate` travels only with its own trace. With the trace id in the access log, a request can be followed from the gateway into the services behind it. The gateway records no spans itself (it has no exporter). At an edge facing clients you don't trust, `tracing.trustIncoming: false` starts a new trace for every request, so a client can't attach its requests to your traces; `tracing.enabled: false` passes the headers through untouched.
+- One JSON access-log line per request with `requestId`, `traceId`, `protocol` (`h2` or `http/1.1`), route, status, duration, cache result, attempt count and the registered key *name* (never the key). `X-Request-Id` is propagated upstream (client-supplied ids are accepted only if they're safe to log).
+- **Trace context** ([W3C](https://www.w3.org/TR/trace-context/)). Every forwarded request, WebSocket handshakes and background cache refreshes included, carries a `traceparent` naming the gateway's hop as the parent: the caller's trace continued if it sent a valid one, otherwise a new one. The caller's `tracestate` travels only with its own trace. With the trace id in the access log, a request can be followed from the gateway into the services behind it. At an edge facing clients you don't trust, `tracing.trustIncoming: false` starts a new trace for every request, so a client can't attach its requests to your traces; `tracing.enabled: false` passes the headers through untouched.
+- **Spans, exported to OpenTelemetry** (`tracing.otlp`), over OTLP/HTTP with a JSON body (no extra dependency):
+
+  ```json
+  "tracing": { "sampleRatio": 0.1, "otlp": { "endpoint": "http://otel-collector:4318/v1/traces", "headers": { "x-api-key": "${OTEL_KEY}" } } }
+  ```
+
+  - One **server** span per request, named by method and route prefix (`GET /orders`), with OpenTelemetry's HTTP attributes plus the gateway's own (route, request id, upstream, cache result, caller name, rate-limited, auth failure); a 5xx makes it an error.
+  - One **client** span per upstream attempt, from sending the request to its response headers. Each attempt is its own hop in `traceparent`, so the upstream's spans hang off the attempt that reached it, and a retried request shows each try (`http.request.resend_count`), the failed ones marked as errors.
+  - One **internal** span per background cache refresh, beneath the request that set it off.
+  - `sampleRatio` keeps that share of the traces started here (by trace id, so the same answer every time for a trace); a trace continued from a caller keeps the caller's decision. The decision goes downstream in the flags, so the services behind record the same traces.
+  - **Exporting never slows or fails a request.** Spans wait in a bounded queue (`maxQueueSpans`) and go out in batches (`batchSize`, at least every `flushIntervalMs`). A collector that is slow, refusing or down costs dropped spans, counted in `gateway_trace_spans_dropped_total{reason}` (`queue_full`, `export_failed`), never memory or latency. Shutdown sends what is still queued; a reload that changes the collector moves to it.
+  - Spans carry request paths and the names of authenticated callers, so start-up warns about a plain-HTTP collector off the machine.
 
 ## Performance
 
@@ -553,7 +628,7 @@ docker run --rm -v "$PWD:/app" -w /app node:24-alpine node bench/run.mjs --repea
 ```bash
 npm test                        # unit, end-to-end, protocol hardening (POSIX-signal test skipped on Windows)
 npm run check                   # typecheck + lint + tests
-docker compose run --rm tests   # the whole suite on Linux, against the Compose Redis
+docker compose run --rm tests   # the whole suite on Linux, against the Compose Redis, Sentinel group and Cluster
 ```
 
 - **Two phases.** `npm test` runs the in-process tests first, in parallel, and then the tests that start real processes and race real clocks (`test/e2e/`, the cluster integration test, the process test) one file at a time (see `vitest.config.ts`). They are heavy and sensitive to a starved CPU, and they would otherwise starve tests such as the Redis parity checks, where Redis expires keys in real time while the test drives an injected clock.
@@ -564,6 +639,11 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
 - **Edge-case tests** ([`gateway.edge.test.ts`](test/gateway.edge.test.ts)): `HEAD`, chunked uploads, upstreams dying mid-body, HTTPS upstreams, clients leaving during coalesced fetches, graceful shutdown.
 - **Reload tests** ([`gateway.reload.test.ts`](test/gateway.reload.test.ts)) change the configuration under a running gateway: routes, keys and upstreams coming and going, a request in flight finishing on an upstream that was replaced under it, unchanged upstreams keeping their connections and circuit state, limits keeping or restarting their counts, a broken file changing nothing, settings that need a restart, TLS, the cache, health checks, open WebSockets, and the endpoint's guards.
 - **Feature tests** for per-route policies ([`gateway.routePolicy.test.ts`](test/gateway.routePolicy.test.ts)), serving stale ([`gateway.stale.test.ts`](test/gateway.stale.test.ts)), trace context ([`trace.test.ts`](test/trace.test.ts), [`gateway.trace.test.ts`](test/gateway.trace.test.ts)) and client certificates towards upstreams ([`gateway.upstreamMtls.test.ts`](test/gateway.upstreamMtls.test.ts)).
+- **HTTP/2 tests** ([`gateway.http2.test.ts`](test/gateway.http2.test.ts)) use Node's own HTTP/2 client: ALPN with HTTP/1.1 on the same port, many requests on one connection, the stream limit, uploads refused without ending the connection, the request deadline per stream, a client that stops reading and an upstream that dies mid-body (each must reset with an error code, never `NO_ERROR`), GOAWAY on idle and on shutdown, WebSockets and client certificates on an HTTP/2 listener.
+- **Client-certificate tests** ([`gateway.clientCert.test.ts`](test/gateway.clientCert.test.ts)) against a test CA (`test/fixtures/tls/callers/`): valid, revoked, expired and impostor certificates, two CAs issuing the same name, allowed names, `required`, a new revocation list on reload.
+- **WebSocket message tests** ([`wsFrames.test.ts`](test/wsFrames.test.ts), [`gateway.wsLimits.test.ts`](test/gateway.wsLimits.test.ts)): frames passed byte for byte however the bytes are split, size and rate limits, protocol violations, close frames at frame boundaries, and the upstream's replies delivered before the gateway's close.
+- **Tracing export tests** ([`otlp.test.ts`](test/otlp.test.ts), [`gateway.otlp.test.ts`](test/gateway.otlp.test.ts)) against a fake collector: the OTLP/JSON body, batching, a full queue, a refusing, unreachable or silent collector, spans joined to the caller's trace and the upstream's, retries, sampling, reload and shutdown.
+- **Redis topology tests** ([`redis.topologies.integration.test.ts`](test/redis.topologies.integration.test.ts)) run in the Compose test profile against a three-node Redis Cluster and a primary, replica and sentinel: exact admission across nodes, two gateways sharing a budget, and a failover forced mid-traffic. Skipped without `REDIS_CLUSTER_NODES` / `REDIS_SENTINEL_NODES`.
 - **Redis integration tests** run the Lua scripts against a real Redis. They check exact parity with the in-memory implementation over randomized sequences, and exactly-`limit` admission under a concurrent flood from several clients. They are skipped unless `REDIS_URL` is set:
 
   ```bash
@@ -575,9 +655,9 @@ docker compose run --rm tests   # the whole suite on Linux, against the Compose 
 - **Process test** ([`test/process.test.ts`](test/process.test.ts)) starts the real entrypoint and sends it `SIGTERM` mid-request (Linux/macOS).
 - **Cluster tests**: the supervisor (restart and backoff, crash loops, start-up failure, shutdown, the questions it asks workers) runs against fake workers and a fake clock ([`supervisor.test.ts`](test/supervisor.test.ts)), metrics merging and config are unit tests, and [`cluster.integration.test.ts`](test/cluster.integration.test.ts) starts the real entrypoint with several workers against Redis (shared limits, one scrape for all workers, a killed worker replaced, start-up refused when workers cannot start, `SIGTERM` draining on POSIX). Skipped without `REDIS_URL`.
 
-The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones; for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown; for the cluster the restart backoff, stale-worker handling, reply validation, start-up give-up and the shared limits; for reloads the settings held until a restart, replaced upstreams draining before they close, limiter pruning and the endpoint's guards; and the stale-serving windows, trace-context validation, per-route policies and client certificates towards upstreams), a test fails.
+The security-critical lines were **mutation-checked**: with each defence deliberately removed (address ceiling, admin isolation, header allowlist, forwarding-header rebuild, method allowlist, in-flight cap, admin token check, buffer budget, error redaction, IPv6 masking, registry lookup, target selection, the Lua off-by-ones; for WebSockets the origin check, handshake validation, upstream accept-key, subprotocol and extension checks, connection cap, and shutdown; for the cluster the restart backoff, stale-worker handling, reply validation, start-up give-up and the shared limits; for reloads the settings held until a restart, replaced upstreams draining before they close, limiter pruning and the endpoint's guards; the stale-serving windows, trace-context validation, per-route policies and client certificates towards upstreams; and for the newest features, the Sentinel and Cluster client settings, client-certificate verification, revocation and identity, every WebSocket frame rule and limit, HTTP/2's stream resets, limits and shutdown, and the span exporter's queue, batching and timeouts), a test fails.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint, the suite against a Redis service container on Node 22 and 24, a production-dependency audit, and a Docker image smoke test. Lint and format are [Biome](https://biomejs.dev) (`npm run lint`, `npm run lint:fix`).
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs typecheck, lint, the suite against a Redis service container on Node 22 and 24, the Sentinel and Cluster tests in the Compose test profile, a production-dependency audit, and a Docker image smoke test. Lint and format are [Biome](https://biomejs.dev) (`npm run lint`, `npm run lint:fix`).
 
 ## Layout
 
@@ -605,8 +685,10 @@ src/
   cache/
     policy.ts             what may be stored, for how long, and how long it may be served stale
     responseCache.ts      LRU + byte budget + single-flight
-  proxy/                  upstream HTTP client (requests and upgrades), hop-by-hop headers, WebSocket handshake rules and tunnel
-  observability/          logger, Prometheus registry, process metrics, W3C trace context
+  redisClient.ts          one Redis server, a Sentinel group or a Cluster, with fail-fast settings
+  proxy/                  upstream HTTP client (requests and upgrades), hop-by-hop headers, WebSocket handshake rules,
+                          tunnel, and the frame reader that enforces per-message limits (wsFrames.ts)
+  observability/          logger, Prometheus registry, process metrics, W3C trace context, OTLP span exporter
 test/                     unit, end-to-end, security, protocol hardening, Redis integration, process signals
 bench/                    load generator, benchmark, soak test, CPU profiler
 demo/                     flaky upstream and load script
@@ -616,13 +698,13 @@ demo/                     flaky upstream and load script
 
 Deliberate scope limits rather than oversights:
 
-- **HTTP/1.1 only.** No HTTP/2 or HTTP/3 (so no WebSockets over HTTP/2 either). WebSockets are proxied as opaque byte tunnels: no per-message limits (see "WebSockets").
+- **HTTP/2 towards clients only, and only over TLS.** Upstreams are called over HTTP/1.1; there is no cleartext HTTP/2 (h2c), no HTTP/3, and no WebSockets over HTTP/2 (RFC 8441), so browsers open those over HTTP/1.1, which the same port serves.
 - **One core per worker.** Node runs the request path on a single thread. Cluster mode uses every core of one machine ("Scaling across cores"); beyond a machine, run more instances: the shared limiter state in Redis assumes it. See "Performance" for what one core does.
 - **Request bodies are buffered** (up to `maxBodyBytes`) so retries can replay them; responses are streamed.
 - **Cache and breaker state are per instance.** That's usually what you want for a breaker (each instance protects itself) but a shared Redis-backed cache would raise hit rates across a fleet.
-- **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or revocation, and no client certificates from callers (the gateway presents one to upstreams, but doesn't ask clients for one).
-- **Traces are propagated, not recorded.** Trace context is passed on and trace ids are logged, but the gateway exports no spans of its own (no OpenTelemetry exporter).
-- **Redis is one endpoint.** There is no Sentinel or Redis Cluster support; for failover, use a Redis service that keeps one address.
-- **A reload can't rebind.** The ports, host, Redis connection, number of workers, admin address and TLS on or off need a restart (see "Reloading without a restart").
+- **Authentication is credential checking, not an identity provider** (see "Authentication"): no sessions, OAuth flows, token introspection, JWKS or JWT revocation. Client certificates are revoked with a CRL file, not checked online (no OCSP).
+- **WebSocket payloads are not inspected.** Message size and rate are limited; what a message says, and what a compressed one inflates to, is the upstream's to check.
+- **Spans are exported over OTLP/HTTP with JSON only** (no gRPC or protobuf encoding), and only traces and correlation: metrics stay Prometheus and logs stay JSON lines.
+- **A reload can't rebind.** The ports, host, Redis connection, number of workers, admin address, TLS, HTTP/2 and client-certificate on or off need a restart (see "Reloading without a restart").
 - **Sliding window log memory is O(limit) per key.** Use `sliding-window-counter` where the limit is large.
 - Weighted/zone-aware balancing and DNS-based service discovery are natural extensions.

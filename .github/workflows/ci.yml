@@ -47,6 +47,17 @@ jobs:
       - name: Dependency audit
         run: npm audit --omit=dev --audit-level=high
 
+  redis-topologies:
+    # The Sentinel and Cluster tests need those deployments, which the Compose test profile starts: a primary,
+    # replica and sentinel, and a three-node cluster. (The Node jobs above cover everything else.)
+    name: Redis Sentinel and Cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker compose run --rm --build tests npx vitest run test/redis.topologies.integration.test.ts
+      - if: always()
+        run: docker compose --profile test down
+
   docker:
     name: Docker image
     runs-on: ubuntu-latest
