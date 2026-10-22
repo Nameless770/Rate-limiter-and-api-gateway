@@ -349,6 +349,9 @@ export function httpsRequest(
     agent?: https.Agent | false;
     minVersion?: 'TLSv1.2' | 'TLSv1.3';
     maxVersion?: 'TLSv1.2' | 'TLSv1.3';
+    /** A client certificate and key to present (mutual TLS). */
+    cert?: Buffer;
+    key?: Buffer;
   },
 ): Promise<TlsResponse> {
   const { hostname, port } = new URL(base);
@@ -364,6 +367,8 @@ export function httpsRequest(
         agent: opts.agent ?? false,
         minVersion: opts.minVersion,
         maxVersion: opts.maxVersion,
+        cert: opts.cert,
+        key: opts.key,
       },
       (res) => {
         const chunks: Buffer[] = [];

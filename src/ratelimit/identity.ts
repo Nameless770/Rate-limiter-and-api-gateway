@@ -13,7 +13,7 @@ export interface Identity {
   /** Per-route replacement rules for this key; `false` means unlimited on that route. */
   overrides?: Record<string, RateLimitRuleConfig | false>;
   /** How the caller proved who they are, when the gateway checked. */
-  authMethod?: 'api-key' | 'jwt';
+  authMethod?: 'api-key' | 'jwt' | 'client-cert';
 }
 
 export type IdentityResult = { ok: true; identity: Identity } | { ok: false; reason: 'key_required' };

@@ -286,8 +286,8 @@ const websocketSchema = z.strictObject({
 });
 
 const routeAuthSchema = z.strictObject({
-  /** How a caller may prove who they are on this route. */
-  methods: z.array(z.enum(['api-key', 'jwt'])).min(1),
+  /** How a caller may prove who they are on this route. `client-cert` needs `tls.clientAuth`. */
+  methods: z.array(z.enum(['api-key', 'jwt', 'client-cert'])).min(1),
   /**
    * true: a request with no credential is refused (401). false: anonymous callers are allowed, but a credential
    * that is *presented* and invalid is still refused, so a bad token never silently downgrades to anonymous.
@@ -388,6 +388,25 @@ export const configSchema = z
         minVersion: z.enum(['TLSv1.2', 'TLSv1.3']).default('TLSv1.2'),
         /** Send `Strict-Transport-Security: max-age=N` on every response. Leave unset until you are sure. */
         hstsMaxAgeSeconds: z.number().int().min(1).max(63_072_000).optional(),
+        /**
+         * Ask clients for a certificate (mutual TLS), so routes can authenticate callers with `client-cert`. Only a
+         * certificate issued by `caFile`, unexpired and not on `crlFile`, counts.
+         */
+        clientAuth: z
+          .strictObject({
+            /** PEM bundle of the CA(s) that issue callers' certificates. Only these are trusted, never the system's. */
+            caFile: z.string().min(1),
+            /** PEM certificate revocation list(s) from those CAs. Re-read on every reload. */
+            crlFile: z.string().min(1).optional(),
+            /**
+             * true: a connection without a valid certificate is refused during the handshake, on every route. false
+             * (the default): the certificate is asked for, and routes decide; one without `client-cert` ignores it.
+             */
+            required: z.boolean().default(false),
+            /** Accept only certificates with one of these subject common names. Unset: any the CA issued. */
+            allowedNames: z.array(z.string().min(1)).min(1).optional(),
+          })
+          .optional(),
       })
       .optional(),
 
@@ -718,6 +737,13 @@ export const configSchema = z
           code: 'custom',
           path: ['routes', i, 'auth', 'methods'],
           message: 'the "jwt" method needs auth.jwt.issuers to be configured',
+        });
+      }
+      if (route.auth?.methods.includes('client-cert') && !cfg.tls?.clientAuth) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['routes', i, 'auth', 'methods'],
+          message: 'the "client-cert" method needs tls.clientAuth to be configured',
         });
       }
       if (route.auth?.methods.includes('api-key') && rl.apiKeys.length === 0) {

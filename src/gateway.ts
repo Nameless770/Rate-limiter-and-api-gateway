@@ -162,7 +162,18 @@ interface TlsMaterial {
   key: Buffer;
   passphrase?: string;
   notAfter: Date;
+  /** The CA bundle callers' certificates must chain to, and its revocation list (client-certificate auth only). */
+  clientCa?: Buffer;
+  crl?: Buffer;
 }
+
+type AuthMethod = NonNullable<RouteConfig['auth']>['methods'][number];
+
+/** What a caller's TLS certificate comes to, on a listener that asks for one. */
+type PeerCertificate =
+  | { kind: 'none' }
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'valid'; name: string; issuer: string; sha256: string; id: string };
 
 interface RequestContext {
   /** The configuration this request runs under, from start to finish. */
@@ -186,7 +197,7 @@ interface RequestContext {
   /** Request-body bytes this request is holding against the global buffer budget. */
   buffered: number;
   /** Set when the gateway itself verified the caller (a route with `auth`). Only then is the upstream told who. */
-  auth?: { method: 'api-key' | 'jwt'; client: string; issuer?: string };
+  auth?: { method: AuthMethod; client: string; issuer?: string; certSha256?: string };
   /** Why authentication failed. A short enumerated code, safe to log; never sent to the client. */
   authFailure?: string;
   /** The connection was upgraded to a WebSocket: the response is a 101 the gateway wrote itself. */
@@ -252,7 +263,12 @@ class ClientAbortedError extends Error {
 }
 
 /** Headers the gateway sets to tell an upstream who it authenticated. Always stripped from incoming requests. */
-const IDENTITY_HEADERS = ['x-authenticated-client', 'x-authenticated-method', 'x-authenticated-issuer'];
+const IDENTITY_HEADERS = [
+  'x-authenticated-client',
+  'x-authenticated-method',
+  'x-authenticated-issuer',
+  'x-client-cert-sha256',
+];
 
 /**
  * A value that is safe in an HTTP header. Subjects come from signed tokens but are still free text: one containing
@@ -444,6 +460,16 @@ export class Gateway {
           minVersion: config.tls.minVersion,
           // A client that connects and never completes the handshake would otherwise hold a socket for two minutes.
           handshakeTimeout: limits.headersTimeoutMs,
+          // Callers' certificates: asked for when client-certificate auth is on. Unless every route needs one, a
+          // connection without a (valid) certificate still gets through the handshake, and each route decides.
+          ...(config.tls.clientAuth
+            ? {
+                requestCert: true,
+                rejectUnauthorized: config.tls.clientAuth.required,
+                ca: material.clientCa,
+                crl: material.crl,
+              }
+            : {}),
         },
         onRequest,
       );
@@ -502,6 +528,9 @@ export class Gateway {
       key: material.key,
       passphrase: material.passphrase,
       minVersion: tls.minVersion,
+      // A new CA bundle or revocation list applies to the next handshake, like a new certificate.
+      ca: material.clientCa,
+      crl: material.crl,
     });
     this.certNotAfter = material.notAfter;
     this.logger.info('tls certificate reloaded', { notAfter: material.notAfter.toISOString() });
@@ -1207,14 +1236,25 @@ export class Gateway {
       if (!outcome.ok) {
         ctx.authFailure = outcome.reason;
         this.mUnauthorized.inc({ route: routeId });
-        this.sendError(res, ctx, 401, 'unauthorized', 'a valid credential is required', {
-          'www-authenticate': outcome.challenge,
-        });
+        // A certificate is asked for during the handshake, so HTTP has no challenge to send for it.
+        this.sendError(
+          res,
+          ctx,
+          401,
+          'unauthorized',
+          'a valid credential is required',
+          outcome.challenge ? { 'www-authenticate': outcome.challenge } : {},
+        );
         return false;
       }
       identity = outcome.identity;
       if (outcome.authenticated) {
-        ctx.auth = { method: outcome.method as 'api-key' | 'jwt', client: outcome.client, issuer: outcome.issuer };
+        ctx.auth = {
+          method: outcome.method as AuthMethod,
+          client: outcome.client,
+          issuer: outcome.issuer,
+          certSha256: outcome.certSha256,
+        };
       }
     } else {
       const resolved = rt.identities.resolve(presented || undefined, ip);
@@ -1265,10 +1305,19 @@ export class Gateway {
     presentedKey: string | undefined,
     ip: string,
   ):
-    | { ok: true; identity: Identity; method: string; authenticated: boolean; client: string; issuer?: string }
+    | {
+        ok: true;
+        identity: Identity;
+        method: string;
+        authenticated: boolean;
+        client: string;
+        issuer?: string;
+        certSha256?: string;
+      }
     | { ok: false; method: string; reason: string; challenge: string } {
     const wantsJwt = auth.methods.includes('jwt');
     const wantsKey = auth.methods.includes('api-key');
+    const wantsCert = auth.methods.includes('client-cert');
     const challenge = (invalidToken: boolean): string =>
       [
         wantsJwt ? (invalidToken ? 'Bearer error="invalid_token"' : 'Bearer') : undefined,
@@ -1276,6 +1325,32 @@ export class Gateway {
       ]
         .filter(Boolean)
         .join(', ');
+
+    // A certificate is checked first: it was presented before any header was sent. One that was presented and does
+    // not verify is refused here like any other bad credential, rather than falling back to a token or a key.
+    if (wantsCert) {
+      const cert = this.peerCertificate(req, rt);
+      if (cert.kind === 'invalid') {
+        return { ok: false, method: 'client-cert', reason: cert.reason, challenge: challenge(false) };
+      }
+      if (cert.kind === 'valid') {
+        return {
+          ok: true,
+          method: 'client-cert',
+          authenticated: true,
+          client: cert.name,
+          issuer: cert.issuer,
+          certSha256: cert.sha256,
+          identity: {
+            id: cert.id,
+            kind: 'key',
+            name: cert.name.slice(0, 128),
+            multiplier: 1,
+            authMethod: 'client-cert',
+          },
+        };
+      }
+    }
 
     if (wantsJwt && rt.jwt) {
       const token = bearerToken(req.headers.authorization);
@@ -1307,6 +1382,41 @@ export class Gateway {
       ? anonymous.identity
       : { id: `ip:${ip}`, kind: 'anonymous', multiplier: rt.config.rateLimit.anonymousMultiplier };
     return { ok: true, method: 'none', authenticated: false, client: '', identity };
+  }
+
+  /**
+   * The certificate the caller presented in the TLS handshake. OpenSSL has already checked it against
+   * `tls.clientAuth.caFile` and the revocation list; `authorized` says whether it passed. The caller is then named by
+   * the certificate's subject common name, and identified (for rate limits) by its issuer and subject together, so a
+   * renewed certificate keeps its budget while another CA cannot mint a lookalike.
+   */
+  private peerCertificate(req: IncomingMessage, rt: Runtime): PeerCertificate {
+    const socket = req.socket as TLSSocket;
+    if (!socket.encrypted || typeof socket.getPeerCertificate !== 'function') return { kind: 'none' };
+    const peer = socket.getPeerCertificate();
+    if (!peer || Object.keys(peer).length === 0) return { kind: 'none' };
+    if (!socket.authorized) {
+      const code = String(socket.authorizationError ?? 'unverified').replace(/[^A-Za-z0-9_]/g, '_');
+      return { kind: 'invalid', reason: `client_cert_${code.toLowerCase()}`.slice(0, 64) };
+    }
+    const subject = peer.subject as unknown as Record<string, string | string[]> | undefined;
+    const issuer = peer.issuer as unknown as Record<string, string | string[]> | undefined;
+    const name = subject?.['CN'];
+    // A certificate with no common name, or several, does not say who it is unambiguously.
+    if (typeof name !== 'string' || name === '') return { kind: 'invalid', reason: 'client_cert_no_common_name' };
+    const allowed = rt.config.tls?.clientAuth?.allowedNames;
+    if (allowed && !allowed.includes(name)) return { kind: 'invalid', reason: 'client_cert_name_not_allowed' };
+    const issuerName = issuer?.['CN'];
+    const digest = createHash('sha256')
+      .update(`${distinguishedName(issuer)}\u0000${distinguishedName(subject)}`)
+      .digest('hex');
+    return {
+      kind: 'valid',
+      name,
+      issuer: typeof issuerName === 'string' ? issuerName : distinguishedName(issuer),
+      sha256: (peer.fingerprint256 ?? '').replace(/:/g, '').toLowerCase(),
+      id: `c:${digest.slice(0, 32)}`,
+    };
   }
 
   private jwtIdentity(rt: Runtime, issuer: JwtIssuer, subject: string): Identity {
@@ -2126,11 +2236,13 @@ export class Gateway {
         headers['x-authenticated-method'] = ctx.auth.method;
         headers['x-authenticated-client'] = headerSafe(ctx.auth.client);
         if (ctx.auth.issuer) headers['x-authenticated-issuer'] = headerSafe(ctx.auth.issuer);
+        if (ctx.auth.certSha256) headers['x-client-cert-sha256'] = ctx.auth.certSha256;
       }
       if (!config.auth.forwardCredentials) {
         // Only the credential the gateway consumed: other schemes in Authorization are the upstream's business.
+        // (A certificate is not a header: there is nothing to withhold.)
         if (ctx.auth.method === 'jwt') delete headers['authorization'];
-        else delete headers[config.rateLimit.identityHeader];
+        else if (ctx.auth.method === 'api-key') delete headers[config.rateLimit.identityHeader];
       }
     }
 
@@ -2492,7 +2604,33 @@ function readTlsMaterial(tls: NonNullable<GatewayConfig['tls']>): TlsMaterial {
   } catch (error) {
     throw new ConfigError(`tls: the certificate and key are not a usable pair: ${(error as Error).message}`);
   }
-  return { cert, key, passphrase: tls.passphrase, notAfter: new X509Certificate(cert).validToDate };
+  const material: TlsMaterial = {
+    cert,
+    key,
+    passphrase: tls.passphrase,
+    notAfter: new X509Certificate(cert).validToDate,
+  };
+  if (tls.clientAuth) {
+    const ca = readFileOrFail('tls.clientAuth.caFile', tls.clientAuth.caFile);
+    const crl = tls.clientAuth.crlFile ? readFileOrFail('tls.clientAuth.crlFile', tls.clientAuth.crlFile) : undefined;
+    try {
+      new X509Certificate(ca); // at least one certificate, not an empty or unrelated file
+      createSecureContext({ ca, crl }); // and a revocation list OpenSSL can read
+    } catch (error) {
+      throw new ConfigError(
+        `tls.clientAuth: the CA bundle or revocation list cannot be used: ${(error as Error).message}`,
+      );
+    }
+    Object.assign(material, { clientCa: ca, crl });
+  }
+  return material;
+}
+
+/** The distinguished name of a certificate's subject or issuer, written out (for identities and logs). */
+function distinguishedName(name: Record<string, string | string[]> | undefined): string {
+  return Object.entries(name ?? {})
+    .map(([attribute, value]) => `${attribute}=${[value].flat().join('+')}`)
+    .join(',');
 }
 
 /** What an upstream's TLS settings point at, read once per configuration. */
@@ -2586,6 +2724,14 @@ function keepFixed(current: GatewayConfig, next: GatewayConfig): { config: Gatew
   if ((current.tls === undefined) !== (next.tls === undefined)) {
     restartRequired.push('tls');
     config.tls = current.tls;
+  }
+  // Whether the listener asks for client certificates, and refuses connections without one, is settled when it is
+  // created; the CA bundle, revocation list and allowed names can change.
+  const was = current.tls?.clientAuth;
+  const will = config.tls?.clientAuth;
+  if (config.tls && ((was === undefined) !== (will === undefined) || (was && will && was.required !== will.required))) {
+    restartRequired.push('tls.clientAuth');
+    config.tls = { ...config.tls, clientAuth: was && (will ? { ...will, required: was.required } : was) };
   }
   // The admin listener is bound once; its token can change.
   const { admin } = current;
