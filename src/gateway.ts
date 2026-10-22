@@ -2541,7 +2541,7 @@ export class Gateway {
       traceId: ctx.trace?.traceId,
       method: ctx.method,
       // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
-      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}Ã¢â‚¬Â¦` : ctx.path,
+      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path,
       route: ctx.route,
       status,
       durationMs: Math.round(durationMs * 10) / 10,
