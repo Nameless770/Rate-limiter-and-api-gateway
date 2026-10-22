@@ -80,6 +80,8 @@ export interface WsUpstreamOptions {
   greeting?: string;
   /** Do not close our side when the peer hangs up (a misbehaving server). */
   stubborn?: boolean;
+  /** Answer a close frame with this code (and no reason) instead of echoing the peer's. */
+  closeCode?: number;
   /** Serve wss:// with this key and certificate. */
   tls?: { key: string | Buffer; cert: string | Buffer };
 }
@@ -158,7 +160,11 @@ export async function startWsUpstream(options: WsUpstreamOptions = {}): Promise<
           } else if (frame.opcode === OP.ping) {
             socket.write(encodeFrame(OP.pong, frame.payload, false));
           } else if (frame.opcode === OP.close) {
-            socket.write(encodeFrame(OP.close, frame.payload, false));
+            const reply =
+              options.closeCode === undefined
+                ? frame.payload
+                : Buffer.from([options.closeCode >> 8, options.closeCode & 0xff]);
+            socket.write(encodeFrame(OP.close, reply, false));
             socket.end();
           }
         }

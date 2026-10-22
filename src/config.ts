@@ -283,6 +283,23 @@ const websocketSchema = z.strictObject({
   maxDurationMs: positiveInt.optional(),
   /** Most simultaneous WebSockets on this route. */
   maxConnections: positiveInt.default(1_000),
+  /**
+   * Largest message a client may send, in bytes (a fragmented message counts all its frames). A client over it is
+   * sent close code 1009 and the offending message never reaches the upstream. With permessage-deflate negotiated
+   * this is the compressed size: the upstream must still bound what a message inflates to.
+   */
+  maxMessageBytes: positiveInt.optional(),
+  /**
+   * Messages (pings included) a client may send on one connection: `perSecond` on average, `burst` at once. A client
+   * over it is sent close code 1008. The connection rate limit (the route's `rateLimit`) still governs opening them.
+   */
+  messageRate: z
+    .strictObject({
+      perSecond: z.number().positive().max(100_000),
+      burst: positiveInt.max(100_000).optional(),
+    })
+    .transform((rate) => ({ perSecond: rate.perSecond, burst: rate.burst ?? Math.max(1, Math.ceil(rate.perSecond)) }))
+    .optional(),
 });
 
 const routeAuthSchema = z.strictObject({

@@ -1,14 +1,15 @@
 /**
  * The pieces of WebSocket proxying that do not depend on the gateway: validating the opening handshake,
- * computing the accept key, matching origins, and piping a tunnel with an idle timeout and a lifetime.
+ * computing the accept key, matching origins, and running a tunnel with an idle timeout, a lifetime and limits on
+ * the messages a client sends.
  *
- * The gateway does not parse WebSocket frames. After the handshake it moves bytes, so it cannot rate limit or
- * inspect individual messages. What it can and does enforce is everything around the connection: who may open
- * one (origin, authentication, the connection rate limit), how many may be open, and for how long.
+ * After the handshake the gateway relays frames byte for byte. It reads their headers (where each frame begins and
+ * ends, how big each message is), never their contents, so payloads are neither inspected nor altered.
  */
 import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { FrameStream, type MessageLimits, type Violation } from './wsFrames.js';
 
 export const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -137,7 +138,14 @@ export function checkUpstreamHandshake(
   return { ok: true, protocol, extensions };
 }
 
-export type TunnelCloseReason = 'client' | 'upstream' | 'idle' | 'max_duration' | 'shutdown' | 'error';
+export type TunnelCloseReason =
+  | 'client'
+  | 'upstream'
+  | 'idle'
+  | 'max_duration'
+  | 'shutdown'
+  | 'error'
+  | Violation['kind'];
 
 /**
  * After one side sends FIN the other is ended once what it had in flight is flushed. A peer that never finishes
@@ -148,6 +156,10 @@ export const HALF_CLOSE_GRACE_MS = 1_000;
 export interface TunnelOptions {
   idleTimeoutMs: number;
   maxDurationMs?: number;
+  /** Limits on each message the client sends. A client over one is sent a close frame saying which. */
+  limits?: MessageLimits;
+  /** What the client sent before the tunnel opened (right behind its handshake): relayed first, and checked. */
+  initial?: Buffer;
   onClose: (reason: TunnelCloseReason, bytesFromClient: number, bytesFromUpstream: number) => void;
 }
 
@@ -155,23 +167,46 @@ export interface Tunnel {
   close(reason: TunnelCloseReason): void;
 }
 
-/** Move bytes both ways until either side goes away, goes quiet, or the connection has lived long enough. */
+/**
+ * Move frames both ways until either side goes away, goes quiet, breaks a limit, or the connection has lived long
+ * enough. Frames are relayed byte for byte; only their headers are read (see wsFrames.ts).
+ */
 export function openTunnel(client: Duplex, upstream: Duplex, opts: TunnelOptions): Tunnel {
   let closed = false;
   let fromClient = 0;
   let fromUpstream = 0;
   let lifetime: NodeJS.Timeout | undefined;
   let lingering: NodeJS.Timeout | undefined;
+  /** The limit a client broke, if it broke one: that is why the tunnel closed, whichever socket goes last. */
+  let violation: Violation | undefined;
 
   const close = (reason: TunnelCloseReason): void => {
     if (closed) return;
     closed = true;
     if (lifetime) clearTimeout(lifetime);
     if (lingering) clearTimeout(lingering);
+    if (hurry) clearTimeout(hurry);
     client.destroy();
     upstream.destroy();
-    opts.onClose(reason, fromClient, fromUpstream);
+    toUpstream.destroy();
+    toClient.destroy();
+    opts.onClose(violation?.kind ?? reason, fromClient, fromUpstream);
   };
+
+  // A client that breaks a rule: its direction has already ended with a close frame to the upstream (the offending
+  // frame never left). The upstream answers that with replies still owed to the client's earlier messages and then
+  // a close frame of its own; the client gets those replies, then the gateway's close frame (saying which limit) in
+  // place of the upstream's. An upstream that does not answer in time is not waited for, and a side that has not
+  // closed by the end of the grace period is cut off.
+  let hurry: NodeJS.Timeout | undefined;
+  const onViolation = (found: Violation): void => {
+    violation = found;
+    toClient.replaceNextClose(found.code, found.reason);
+    hurry = setTimeout(() => toClient.closeAtBoundary(found.code, found.reason), HALF_CLOSE_GRACE_MS);
+    lingering ??= setTimeout(() => close(found.kind), 2 * HALF_CLOSE_GRACE_MS);
+  };
+  const toUpstream = new FrameStream({ fromClient: true, limits: opts.limits, onViolation });
+  const toClient = new FrameStream({ fromClient: false, onViolation: () => close('error') });
 
   client.on('data', (chunk: Buffer) => {
     fromClient += chunk.length;
@@ -179,8 +214,14 @@ export function openTunnel(client: Duplex, upstream: Duplex, opts: TunnelOptions
   upstream.on('data', (chunk: Buffer) => {
     fromUpstream += chunk.length;
   });
-  client.pipe(upstream);
-  upstream.pipe(client);
+  if (opts.initial && opts.initial.length > 0) {
+    fromClient += opts.initial.length;
+    toUpstream.write(opts.initial);
+  }
+  client.pipe(toUpstream).pipe(upstream);
+  upstream.pipe(toClient).pipe(client);
+  toUpstream.on('error', () => close('error'));
+  toClient.on('error', () => close('error'));
 
   // A socket's 'close' fires after any 'error' too, so the first to go decides the reason.
   client.on('close', () => close('client'));

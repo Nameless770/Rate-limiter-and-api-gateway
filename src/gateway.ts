@@ -2235,13 +2235,14 @@ export class Gateway {
       if (result.head.length > 0) socket.write(result.head); // frames the upstream sent right behind its 101
       socket.off('data', onEarlyData); // the tunnel reads from here on, in this same tick
       socket.off('end', onHangUp);
-      if (early.length > 0) result.socket.write(Buffer.concat(early)); // the client's, from behind its request
 
       const opened = performance.now();
       const route = ctx.route;
       const tunnel = openTunnel(socket, result.socket, {
         idleTimeoutMs: ws.idleTimeoutMs,
         maxDurationMs: ws.maxDurationMs,
+        limits: { maxMessageBytes: ws.maxMessageBytes, rate: ws.messageRate },
+        initial: early.length > 0 ? Buffer.concat(early) : undefined, // the client's, from behind its request
         onClose: (reason, fromClient, fromUpstream) => {
           this.tunnels.delete(tunnel);
           this.releaseWebsocketSlot(route);
