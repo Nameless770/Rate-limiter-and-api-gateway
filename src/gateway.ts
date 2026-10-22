@@ -5,7 +5,6 @@ import https from 'node:https';
 import type { AddressInfo, Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { createSecureContext, type TLSSocket } from 'node:tls';
-import type { Redis } from 'ioredis';
 import { AdminListener } from './admin.js';
 import { bearerToken, type JwtIssuer, JwtKeyError, JwtVerifier, loadIssuer } from './auth/jwt.js';
 import {
@@ -21,6 +20,7 @@ import {
   type GatewayConfig,
   type RateLimitRuleConfig,
   type RouteConfig,
+  redisMode,
   type UpstreamConfig,
   upstreamTargets,
 } from './config.js';
@@ -42,7 +42,12 @@ import {
 } from './proxy/websocket.js';
 import { type Identity, IdentityResolver, ruleAllowance, ruleFingerprint, scaleRule } from './ratelimit/identity.js';
 import { memorySlidingWindow, memorySlidingWindowCounter, memoryTokenBucket } from './ratelimit/memory.js';
-import { RedisSlidingWindow, RedisSlidingWindowCounter, RedisTokenBucket } from './ratelimit/redis.js';
+import {
+  type RedisConnection,
+  RedisSlidingWindow,
+  RedisSlidingWindowCounter,
+  RedisTokenBucket,
+} from './ratelimit/redis.js';
 import { ResilientRateLimiter } from './ratelimit/resilient.js';
 import {
   algorithmTag,
@@ -60,7 +65,7 @@ export interface GatewayDeps {
   logger?: Logger;
   clock?: Clock;
   /** Connected ioredis client. Without one, rate limiting is in-memory (single instance only). */
-  redis?: Redis;
+  redis?: RedisConnection;
   /** Don't start the background health-check timers; tests drive probes with checkHealthNow(). */
   manualHealthChecks?: boolean;
   /** Test seams for deterministic retry timing. */
@@ -316,7 +321,7 @@ export class Gateway {
   private readonly retiring = new Set<UpstreamRuntime>();
   private readonly logger: Logger;
   private readonly clock: Clock;
-  private readonly redis?: Redis;
+  private readonly redis?: RedisConnection;
   private readonly startedAt: number;
   private readonly admin: AdminListener;
   private readonly stopProcessMetrics: () => void;
@@ -2399,6 +2404,7 @@ export class Gateway {
       uptimeSeconds: Math.floor((this.clock() - this.startedAt) / 1000),
       configGeneration: this.rt.generation,
       redis: this.redis ? this.redis.status : 'disabled',
+      ...(this.redis && this.rt.config.redis ? { redisMode: redisMode(this.rt.config.redis) } : {}),
       connections: this.connections,
       inFlight: this.active.size,
       upstreams,
@@ -2423,7 +2429,7 @@ export class Gateway {
       traceId: ctx.trace?.traceId,
       method: ctx.method,
       // Bounded: the path is client-controlled, and an unbounded value is a log-amplification lever.
-      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}…` : ctx.path,
+      path: ctx.path.length > MAX_LOGGED_PATH ? `${ctx.path.slice(0, MAX_LOGGED_PATH)}Ã¢â‚¬Â¦` : ctx.path,
       route: ctx.route,
       status,
       durationMs: Math.round(durationMs * 10) / 10,

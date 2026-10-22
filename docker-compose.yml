@@ -51,6 +51,70 @@ services:
     ports:
       - "${GATEWAY_B_PORT:-8081}:8080"
 
+  # The two other ways to deploy Redis, for the tests that cover them (test profile only).
+  #
+  # A primary, its replica and one sentinel watching them as "gw". The tests force failovers, so which of the two
+  # is primary at any moment is whatever the sentinel says.
+  redis-primary: &redis-node
+    profiles: ["test"]
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--replica-announce-ip", "redis-primary"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  redis-replica:
+    <<: *redis-node
+    command:
+      ["redis-server", "--save", "", "--appendonly", "no", "--replicaof", "redis-primary", "6379",
+       "--replica-announce-ip", "redis-replica"]
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+
+  redis-sentinel:
+    <<: *redis-node
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s\n' 'port 26379' 'sentinel resolve-hostnames yes' 'sentinel announce-hostnames yes' \
+          'sentinel monitor gw redis-primary 6379 1' 'sentinel down-after-milliseconds gw 2000' \
+          'sentinel failover-timeout gw 10000' > /tmp/sentinel.conf
+        exec redis-sentinel /tmp/sentinel.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    depends_on:
+      redis-replica:
+        condition: service_healthy
+
+  # Three cluster nodes in one container (ports 7000-7002), announcing this service's name so clients in the
+  # Compose network can reach every node the slot map points them at.
+  redis-cluster:
+    <<: *redis-node
+    command:
+      - sh
+      - -c
+      - |
+        for port in 7000 7001 7002; do
+          redis-server --port $$port --cluster-enabled yes --cluster-config-file /tmp/nodes-$$port.conf \
+            --save '' --appendonly no --cluster-announce-hostname redis-cluster \
+            --cluster-preferred-endpoint-type hostname --daemonize yes
+        done
+        sleep 1
+        redis-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-replicas 0 --cluster-yes
+        exec tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 7000 cluster info | grep -q cluster_state:ok"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
   # The whole test suite on Linux against the real Redis above (opt-in: `docker compose run --rm tests`).
   tests:
     profiles: ["test"]
@@ -59,6 +123,13 @@ services:
       target: test
     environment:
       REDIS_URL: redis://redis:6379
+      REDIS_SENTINEL_NODES: redis-sentinel:26379
+      REDIS_SENTINEL_NAME: gw
+      REDIS_CLUSTER_NODES: redis-cluster:7000,redis-cluster:7001,redis-cluster:7002
     depends_on:
       redis:
+        condition: service_healthy
+      redis-sentinel:
+        condition: service_healthy
+      redis-cluster:
         condition: service_healthy

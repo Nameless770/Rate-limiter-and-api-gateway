@@ -6,7 +6,12 @@ import { configDefaults, defineConfig } from 'vitest/config';
  * the Redis parity tests, for one, drive an injected clock but Redis expires keys in real time, so a one-second
  * stall in the middle of them is a failure. So they run in their own phase, after the rest and one file at a time.
  */
-const heavy = ['test/e2e/**/*.test.ts', 'test/cluster.integration.test.ts', 'test/process.test.ts'];
+const heavy = [
+  'test/e2e/**/*.test.ts',
+  'test/cluster.integration.test.ts',
+  'test/process.test.ts',
+  'test/redis.topologies.integration.test.ts',
+];
 
 export default defineConfig({
   test: {

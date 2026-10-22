@@ -12,7 +12,7 @@
  * The Lua below is a line-for-line port of algorithms.ts; test/redis.integration.test.ts asserts parity.
  */
 import { randomBytes } from 'node:crypto';
-import type { Redis } from 'ioredis';
+import type { Cluster, Redis } from 'ioredis';
 import type { SlidingWindowParams, TokenBucketParams } from './algorithms.js';
 import type { Clock, RateLimitDecision, RateLimiter } from './types.js';
 
@@ -179,9 +179,12 @@ interface ScriptCommands {
   gwSlidingCounter(key: string, ...args: (string | number)[]): Promise<ScriptResult>;
 }
 
-type ScriptedRedis = Redis & ScriptCommands;
+/** One server (found directly or through Sentinel), or a whole Redis Cluster: the scripts run the same on both. */
+export type RedisConnection = Redis | Cluster;
 
-function withScripts(redis: Redis): ScriptedRedis {
+type ScriptedRedis = RedisConnection & ScriptCommands;
+
+function withScripts(redis: RedisConnection): ScriptedRedis {
   // defineCommand is idempotent per connection; ioredis uses EVALSHA and falls back to EVAL on NOSCRIPT.
   redis.defineCommand('gwTokenBucket', { numberOfKeys: 1, lua: TOKEN_BUCKET_LUA });
   redis.defineCommand('gwSlidingWindow', { numberOfKeys: 1, lua: SLIDING_WINDOW_LUA });
@@ -221,7 +224,7 @@ export class RedisTokenBucket implements RateLimiter {
   private readonly clock?: Clock;
 
   constructor(
-    redis: Redis,
+    redis: RedisConnection,
     private readonly params: TokenBucketParams,
     options: RedisLimiterOptions = {},
   ) {
@@ -252,7 +255,7 @@ export class RedisSlidingWindow implements RateLimiter {
   private sequence = 0;
 
   constructor(
-    redis: Redis,
+    redis: RedisConnection,
     private readonly params: SlidingWindowParams,
     options: RedisLimiterOptions = {},
   ) {
@@ -282,7 +285,7 @@ export class RedisSlidingWindowCounter implements RateLimiter {
   private readonly clock?: Clock;
 
   constructor(
-    redis: Redis,
+    redis: RedisConnection,
     private readonly params: SlidingWindowParams,
     options: RedisLimiterOptions = {},
   ) {

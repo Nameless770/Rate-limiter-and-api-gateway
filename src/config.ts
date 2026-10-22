@@ -4,6 +4,17 @@ import { isLoopbackHost } from './net/ip.js';
 
 const positiveInt = z.number().int().positive();
 const httpUrl = z.url().refine((u) => /^https?:\/\//.test(u), 'must be an http(s) URL');
+/** A node address: host:port, or [IPv6]:port. */
+const hostPort = z
+  .string()
+  .regex(/^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):\d{1,5}$/, 'must be host:port, e.g. 10.0.0.5:26379')
+  .refine((v) => Number(v.slice(v.lastIndexOf(':') + 1)) <= 65_535, 'port must be at most 65535');
+
+/** Split a validated host:port (the brackets of an IPv6 address removed). */
+export function splitHostPort(value: string): { host: string; port: number } {
+  const colon = value.lastIndexOf(':');
+  return { host: value.slice(0, colon).replace(/^\[(.*)\]$/, '$1'), port: Number(value.slice(colon + 1)) };
+}
 
 export const rateLimitRuleSchema = z.discriminatedUnion('algorithm', [
   z.strictObject({
@@ -380,21 +391,67 @@ export const configSchema = z
       })
       .optional(),
 
+    /**
+     * Where the shared rate-limit state lives: one server (`url`), a primary watched by Sentinel (`sentinel`), or a
+     * Redis Cluster (`cluster`). Exactly one of the three.
+     */
     redis: z
       .strictObject({
-        /** `redis://` or `rediss://` (TLS). A password goes in the URL: rediss://:secret@host:6380. */
-        url: z.string().min(1),
+        /** One server. `redis://` or `rediss://` (TLS). A password goes in the URL: rediss://:secret@host:6380. */
+        url: z.string().min(1).optional(),
+        /**
+         * A primary and its replicas watched by Redis Sentinel. The gateway asks the sentinels where the primary is,
+         * and follows a failover to the replica they promote.
+         */
+        sentinel: z
+          .strictObject({
+            /** The name the sentinels monitor the primary under (`sentinel monitor <name> ...`). */
+            name: z.string().min(1),
+            /** Sentinels as host:port. One is enough to find the primary; list several so one being down is not. */
+            nodes: z.array(hostPort).min(1).max(16),
+            /** For sentinels that require AUTH (`requirepass` in sentinel.conf). Use ${ENV_VAR}. */
+            password: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).optional()),
+          })
+          .optional(),
+        /**
+         * A Redis Cluster. The gateway reads the slot map from these nodes (any reachable one will do) and sends each
+         * key to the node that owns it. Every limiter script touches one key, so no hash tags are needed.
+         */
+        cluster: z.strictObject({ nodes: z.array(hostPort).min(1).max(64) }).optional(),
+        /** With `sentinel` or `cluster`: the data nodes' ACL user and password (with `url`, put them in the URL). */
+        username: z.string().min(1).optional(),
+        password: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).optional()),
+        /** With `sentinel` or `cluster`: speak TLS to every node, sentinels included (with `url`, use rediss://). */
+        tls: z.boolean().default(false),
         keyPrefix: z.string().default('gw:'),
         /** A slow limiter store must not make every request slow: cap each command. */
         commandTimeoutMs: positiveInt.default(100),
-        /** PEM CA bundle for a Redis server signed by a private CA. Requires a rediss:// url. */
+        /** PEM CA bundle for a Redis server signed by a private CA. Requires TLS (a rediss:// url, or `tls`). */
         caFile: z.string().min(1).optional(),
       })
       .superRefine((redis, ctx) => {
-        if (!/^rediss?:\/\//.test(redis.url)) {
-          ctx.addIssue({ code: 'custom', path: ['url'], message: 'must start with redis:// or rediss://' });
-        } else if (redis.caFile && !redis.url.startsWith('rediss://')) {
-          ctx.addIssue({ code: 'custom', path: ['caFile'], message: 'caFile requires a rediss:// url' });
+        const modes = [redis.url, redis.sentinel, redis.cluster].filter((m) => m !== undefined).length;
+        if (modes !== 1) {
+          ctx.addIssue({ code: 'custom', path: [], message: 'set exactly one of "url", "sentinel" or "cluster"' });
+          return;
+        }
+        if (redis.url !== undefined) {
+          if (!/^rediss?:\/\//.test(redis.url)) {
+            ctx.addIssue({ code: 'custom', path: ['url'], message: 'must start with redis:// or rediss://' });
+          } else if (redis.caFile && !redis.url.startsWith('rediss://')) {
+            ctx.addIssue({ code: 'custom', path: ['caFile'], message: 'caFile requires a rediss:// url' });
+          }
+          for (const key of ['username', 'password', 'tls'] as const) {
+            if (key === 'tls' ? redis.tls : redis[key] !== undefined) {
+              ctx.addIssue({
+                code: 'custom',
+                path: [key],
+                message: `with "url", put this in the URL (${key === 'tls' ? 'rediss://' : 'redis://user:password@host'})`,
+              });
+            }
+          }
+        } else if (redis.caFile && !redis.tls) {
+          ctx.addIssue({ code: 'custom', path: ['caFile'], message: 'caFile requires tls: true' });
         }
       })
       .optional(),
@@ -698,6 +755,11 @@ export type RouteConfig = GatewayConfig['routes'][number];
 export type UpstreamConfig = GatewayConfig['upstreams'][string];
 export type RateLimitRuleConfig = z.infer<typeof rateLimitRuleSchema>;
 
+/** How the configuration reaches Redis, for logs and the health report. */
+export function redisMode(redis: NonNullable<GatewayConfig['redis']>): 'standalone' | 'sentinel' | 'cluster' {
+  return redis.cluster ? 'cluster' : redis.sentinel ? 'sentinel' : 'standalone';
+}
+
 /** The URLs of an upstream's targets, whether it was written with `url` or `urls`. */
 export function upstreamTargets(upstream: { url?: string | undefined; urls?: string[] | undefined }): string[] {
   return upstream.urls ?? (upstream.url ? [upstream.url] : []);
@@ -762,7 +824,10 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
       };
     }
     if (env['REDIS_URL']) {
-      obj['redis'] = { ...(obj['redis'] as object | undefined), url: env['REDIS_URL'] };
+      // One server named in the environment replaces whatever the file says about where Redis is (a sentinel or
+      // cluster setup included); the other settings (key prefix, timeouts) are kept.
+      const { sentinel, cluster, username, password, tls, ...rest } = (obj['redis'] ?? {}) as Record<string, unknown>;
+      obj['redis'] = { ...rest, url: env['REDIS_URL'] };
     }
   }
   return parseConfig(raw);

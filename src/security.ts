@@ -1,4 +1,4 @@
-import type { GatewayConfig } from './config.js';
+import { type GatewayConfig, splitHostPort } from './config.js';
 import { isLoopbackHost } from './net/ip.js';
 
 /**
@@ -38,17 +38,27 @@ export function securityNotes(config: GatewayConfig): string[] {
     }
   }
 
-  if (config.redis) {
+  const redis = config.redis;
+  if (redis?.url !== undefined) {
     let host = '';
     try {
-      host = new URL(config.redis.url).hostname;
+      host = new URL(redis.url).hostname;
     } catch {
       // schema validation has already vetted the scheme; an unparsable host just skips this note
     }
-    if (config.redis.url.startsWith('redis://') && host && !isLoopbackHost(host)) {
+    if (redis.url.startsWith('redis://') && host && !isLoopbackHost(host)) {
       notes.push(
         `redis connection to "${host}" is not encrypted (redis://). Rate-limit keys and counters cross the ` +
           'network in plaintext; use rediss:// outside a trusted private network.',
+      );
+    }
+  } else if (redis && !redis.tls) {
+    const nodes = (redis.sentinel?.nodes ?? redis.cluster?.nodes ?? []).map((n) => splitHostPort(n).host);
+    const remote = nodes.find((host) => !isLoopbackHost(host));
+    if (remote !== undefined) {
+      notes.push(
+        `redis ${redis.sentinel ? 'sentinel' : 'cluster'} connections (to "${remote}" and others) are not encrypted. ` +
+          'Rate-limit keys and counters cross the network in plaintext; set redis.tls outside a trusted private network.',
       );
     }
   }
