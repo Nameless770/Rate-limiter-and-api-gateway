@@ -26,14 +26,14 @@
     "bench:profile": "npm run build && node bench/profile.mjs"
   },
   "dependencies": {
-    "ioredis": "^6.0.0",
+    "ioredis": "^6.1.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
-    "@types/node": "^26.6.5",
+    "@biomejs/biome": "2.6.8",
+    "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.4"
+    "vitest": "^5.1.1"
   }
 }
